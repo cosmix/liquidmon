@@ -291,4 +291,205 @@ mod tests {
             ),
         }
     }
+
+    #[test]
+    fn device_missing_pump_speed_yields_missing_field() {
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump duty","value":75,"unit":"%"}
+        ]}]"#;
+        match parse_status_response(raw) {
+            Err(Error::MissingField("pump speed")) => {}
+            other => panic!("expected MissingField(\"pump speed\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_missing_pump_duty_yields_missing_field() {
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"}
+        ]}]"#;
+        match parse_status_response(raw) {
+            Err(Error::MissingField("pump duty")) => {}
+            other => panic!("expected MissingField(\"pump duty\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fan_with_only_speed_is_dropped() {
+        // Fan 1 has speed but no duty -> should be filtered out; Fan 2 is complete.
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"},
+            {"key":"Pump duty","value":75,"unit":"%"},
+            {"key":"Fan 1 speed","value":1000,"unit":"rpm"},
+            {"key":"Fan 2 speed","value":1100,"unit":"rpm"},
+            {"key":"Fan 2 duty","value":50,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert_eq!(status.fans.len(), 1);
+        assert_eq!(status.fans[0].index, 2);
+        assert_eq!(status.fans[0].speed_rpm, 1100);
+        assert_eq!(status.fans[0].duty_pct, 50);
+    }
+
+    #[test]
+    fn fan_with_only_duty_is_dropped() {
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"},
+            {"key":"Pump duty","value":75,"unit":"%"},
+            {"key":"Fan 1 duty","value":40,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert!(status.fans.is_empty());
+    }
+
+    #[test]
+    fn fan_index_zero_is_ignored() {
+        // Fan 0 should be silently dropped per split_fan_key; Fan 1 retained.
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"},
+            {"key":"Pump duty","value":75,"unit":"%"},
+            {"key":"Fan 0 speed","value":900,"unit":"rpm"},
+            {"key":"Fan 0 duty","value":30,"unit":"%"},
+            {"key":"Fan 1 speed","value":1000,"unit":"rpm"},
+            {"key":"Fan 1 duty","value":40,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert_eq!(status.fans.len(), 1);
+        assert_eq!(status.fans[0].index, 1);
+    }
+
+    #[test]
+    fn fans_emerge_sorted_by_index() {
+        // Insert keys in shuffled order; result should still be ordered 1,2,3.
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"},
+            {"key":"Pump duty","value":75,"unit":"%"},
+            {"key":"Fan 3 speed","value":1300,"unit":"rpm"},
+            {"key":"Fan 1 duty","value":40,"unit":"%"},
+            {"key":"Fan 2 speed","value":1200,"unit":"rpm"},
+            {"key":"Fan 3 duty","value":60,"unit":"%"},
+            {"key":"Fan 1 speed","value":1100,"unit":"rpm"},
+            {"key":"Fan 2 duty","value":50,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        let indices: Vec<u8> = status.fans.iter().map(|f| f.index).collect();
+        assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn out_of_range_pump_duty_is_clamped() {
+        // Duty 250 should clamp to 100; Pump speed 5_000_000_000 (> u32 cast safe band) is fine for u32 but ridiculous; choose a value within u32.
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"},
+            {"key":"Pump duty","value":250,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert_eq!(status.pump.duty_pct, 100);
+    }
+
+    #[test]
+    fn negative_values_clamp_to_zero() {
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":-50,"unit":"rpm"},
+            {"key":"Pump duty","value":-10,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert_eq!(status.pump.speed_rpm, 0);
+        assert_eq!(status.pump.duty_pct, 0);
+    }
+
+    #[test]
+    fn first_device_with_status_is_selected() {
+        // Three devices: first empty, second populated, third populated -> second wins.
+        let raw = r#"[
+            {"bus":"hid","address":"/dev/hidraw0","description":"Empty","status":[]},
+            {"bus":"hid","address":"/dev/hidraw1","description":"Picked","status":[
+                {"key":"Liquid temperature","value":31.0,"unit":"°C"},
+                {"key":"Pump speed","value":2000,"unit":"rpm"},
+                {"key":"Pump duty","value":75,"unit":"%"}
+            ]},
+            {"bus":"hid","address":"/dev/hidraw2","description":"Skipped","status":[
+                {"key":"Liquid temperature","value":99.0,"unit":"°C"},
+                {"key":"Pump speed","value":1,"unit":"rpm"},
+                {"key":"Pump duty","value":1,"unit":"%"}
+            ]}
+        ]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert_eq!(status.description, "Picked");
+        assert!((status.liquid_temp_c - 31.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn unknown_keys_are_silently_ignored() {
+        // "Firmware version" is unknown — must not affect parsing.
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Firmware version","value":42,"unit":""},
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2000,"unit":"rpm"},
+            {"key":"Pump duty","value":75,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw).expect("should parse");
+        assert_eq!(status.pump.speed_rpm, 2000);
+    }
+
+    #[test]
+    fn malformed_json_yields_parse_error() {
+        match parse_status_response("not json at all") {
+            Err(Error::Parse(_)) => {}
+            other => panic!("expected Error::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_fan_key_extracts_index_and_suffix() {
+        assert_eq!(split_fan_key("1 speed"), Some((1, "speed")));
+        assert_eq!(split_fan_key("12 duty"), Some((12, "duty")));
+    }
+
+    #[test]
+    fn split_fan_key_rejects_zero_and_malformed() {
+        assert_eq!(split_fan_key("0 speed"), None);
+        assert_eq!(split_fan_key("abc speed"), None);
+        assert_eq!(split_fan_key("1"), None);
+        assert_eq!(split_fan_key(""), None);
+    }
+
+    #[test]
+    fn display_includes_field_name_for_missing_field() {
+        let s = format!("{}", Error::MissingField("liquid temperature"));
+        assert!(s.contains("liquid temperature"), "got: {s}");
+    }
+
+    #[test]
+    fn display_for_no_device_and_timeout() {
+        assert!(!format!("{}", Error::NoDevice).is_empty());
+        assert!(format!("{}", Error::Timeout).contains("timed out"));
+    }
+
+    #[test]
+    fn error_source_chains_for_inner_io_and_parse() {
+        use std::error::Error as _;
+        let io_err = io::Error::other("boom");
+        let e = Error::Spawn(io_err);
+        assert!(e.source().is_some());
+
+        let parse_err = serde_json::from_str::<Vec<DeviceEntry>>("not json")
+            .err()
+            .unwrap();
+        let e = Error::Parse(parse_err);
+        assert!(e.source().is_some());
+
+        // NoDevice / MissingField / Timeout / NonZeroExit have no inner source.
+        assert!(Error::NoDevice.source().is_none());
+        assert!(Error::MissingField("x").source().is_none());
+        assert!(Error::Timeout.source().is_none());
+    }
 }

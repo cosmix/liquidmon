@@ -311,3 +311,137 @@ impl cosmic::Application for AppModel {
         Some(cosmic::applet::style())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::liquidctl::{AioStatus, Fan, Pump};
+    use cosmic::Application as _;
+
+    fn fan(index: u8, duty_pct: u8) -> Fan {
+        Fan {
+            index,
+            speed_rpm: 1000,
+            duty_pct,
+        }
+    }
+
+    fn sample_status(temp_c: f64) -> AioStatus {
+        AioStatus {
+            description: "Test AIO".to_string(),
+            liquid_temp_c: temp_c,
+            pump: Pump {
+                speed_rpm: 2000,
+                duty_pct: 70,
+            },
+            fans: vec![fan(1, 40), fan(2, 50), fan(3, 60)],
+        }
+    }
+
+    #[test]
+    fn fan_duty_avg_is_none_for_empty() {
+        assert_eq!(fan_duty_avg(&[]), None);
+    }
+
+    #[test]
+    fn fan_duty_avg_computes_integer_mean() {
+        assert_eq!(fan_duty_avg(&[fan(1, 40), fan(2, 50), fan(3, 60)]), Some(50));
+    }
+
+    #[test]
+    fn fan_duty_avg_truncates_toward_zero() {
+        // 40 + 50 = 90 / 2 = 45 (exact). Use 41 + 50 = 91 / 2 = 45 (truncated).
+        assert_eq!(fan_duty_avg(&[fan(1, 41), fan(2, 50)]), Some(45));
+    }
+
+    #[test]
+    fn fan_duty_avg_at_max() {
+        assert_eq!(
+            fan_duty_avg(&[fan(1, 100), fan(2, 100), fan(3, 100)]),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn status_tick_ok_appends_temp_and_clears_error() {
+        let mut model = AppModel {
+            last_error: Some("previous error".to_string()),
+            ..AppModel::default()
+        };
+
+        let _ = model.update(Message::StatusTick(Ok(sample_status(30.5))));
+
+        assert_eq!(model.temp_history.len(), 1);
+        assert!((model.temp_history[0] - 30.5).abs() < 1e-9);
+        let status = model.last_status.as_ref().expect("status set");
+        assert!((status.liquid_temp_c - 30.5).abs() < 1e-9);
+        assert!(model.last_error.is_none());
+    }
+
+    #[test]
+    fn status_tick_err_preserves_stale_status() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::StatusTick(Ok(sample_status(31.0))));
+        assert!(model.last_status.is_some());
+
+        let _ = model.update(Message::StatusTick(Err("boom".to_string())));
+
+        // Stale data preserved per src/app.rs:268-275 design comment.
+        assert!(model.last_status.is_some());
+        assert_eq!(model.last_error.as_deref(), Some("boom"));
+        assert_eq!(model.temp_history.len(), 1);
+    }
+
+    #[test]
+    fn temp_history_caps_at_max_samples() {
+        let mut model = AppModel::default();
+        for i in 0..(MAX_SAMPLES + 10) {
+            let _ = model.update(Message::StatusTick(Ok(sample_status(20.0 + i as f64))));
+        }
+        assert_eq!(model.temp_history.len(), MAX_SAMPLES);
+        // Oldest sample dropped: first retained value should be index 10 (=> 30.0).
+        let first = *model.temp_history.front().unwrap();
+        assert!(
+            (first - 30.0).abs() < 1e-9,
+            "first sample after cap should be 30.0, got {first}"
+        );
+        // Newest is the last one pushed.
+        let last = *model.temp_history.back().unwrap();
+        let expected_last = 20.0 + (MAX_SAMPLES + 10 - 1) as f64;
+        assert!((last - expected_last).abs() < 1e-9);
+    }
+
+    #[test]
+    fn popup_closed_with_matching_id_clears_popup() {
+        let mut model = AppModel::default();
+        let id = Id::unique();
+        model.popup = Some(id);
+
+        let _ = model.update(Message::PopupClosed(id));
+
+        assert!(model.popup.is_none());
+    }
+
+    #[test]
+    fn popup_closed_with_non_matching_id_is_noop() {
+        let mut model = AppModel::default();
+        let kept = Id::unique();
+        let other = Id::unique();
+        model.popup = Some(kept);
+
+        let _ = model.update(Message::PopupClosed(other));
+
+        assert_eq!(model.popup, Some(kept));
+    }
+
+    #[test]
+    fn update_config_replaces_config() {
+        let mut model = AppModel::default();
+        let new_cfg = Config::default();
+        let _ = model.update(Message::UpdateConfig(new_cfg));
+        // Config is currently empty; just assert the arm runs and doesn't disturb other state.
+        assert!(model.last_status.is_none());
+        assert!(model.last_error.is_none());
+        assert!(model.temp_history.is_empty());
+    }
+}
