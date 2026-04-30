@@ -157,14 +157,14 @@ fn parse_status_response(raw: &str) -> Result<AioStatus, Error> {
             "Pump speed" => pump_speed = Some(to_u32(value_f64)),
             "Pump duty" => pump_duty = Some(to_u8_pct(value_f64)),
             other => {
-                if let Some(rest) = other.strip_prefix("Fan ") {
-                    if let Some((num, suffix)) = split_fan_key(rest) {
-                        let slot = fans.entry(num).or_insert((None, None));
-                        match suffix {
-                            "speed" => slot.0 = Some(to_u32(value_f64)),
-                            "duty" => slot.1 = Some(to_u8_pct(value_f64)),
-                            _ => {}
-                        }
+                if let Some(rest) = other.strip_prefix("Fan ")
+                    && let Some((num, suffix)) = split_fan_key(rest)
+                {
+                    let slot = fans.entry(num).or_insert((None, None));
+                    match suffix {
+                        "speed" => slot.0 = Some(to_u32(value_f64)),
+                        "duty" => slot.1 = Some(to_u8_pct(value_f64)),
+                        _ => {}
                     }
                 }
                 // Unrecognized keys are silently ignored.
