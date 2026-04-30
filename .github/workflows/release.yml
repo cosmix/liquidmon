@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build .deb + tarball
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Strip binary
+        run: strip target/release/liquidmon
+
+      - name: Build .deb
+        run: cargo deb --no-build --no-strip
+
+      - name: Verify .deb installs cleanly
+        run: |
+          sudo dpkg -i target/debian/*.deb
+          dpkg -L liquidmon
+          command -v liquidmon
+          sudo dpkg -r liquidmon
+
+      - name: Build tarball
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="liquidmon-${version}-x86_64-linux"
+          mkdir -p "dist/${stage}"
+          cp target/release/liquidmon "dist/${stage}/"
+          cp -r resources "dist/${stage}/"
+          cp justfile README.md "dist/${stage}/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp dist/*.tar.gz artifacts/
+          cp target/debian/*.deb artifacts/
+          ( cd artifacts && sha256sum *.tar.gz *.deb > SHA256SUMS )
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

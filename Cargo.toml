@@ -5,6 +5,25 @@ edition = "2024"
 license = "MPL-2.0"
 description = "COSMIC panel applet for Corsair AIO temps and fan/pump duties via liquidctl"
 repository = "https://github.com/cosmix/liquidmon"
+authors = ["Dimosthenis Kaponis <dkaponis@gmail.com>"]
+
+[package.metadata.deb]
+maintainer = "Dimosthenis Kaponis <dkaponis@gmail.com>"
+section = "utility"
+priority = "optional"
+depends = "$auto, liquidctl"
+extended-description = """\
+LiquidMon is a COSMIC panel applet that surfaces Corsair AIO liquid \
+cooler temperatures and pump/fan duty controls. It shells out to \
+liquidctl for device access, so liquidctl must be installed and \
+configured with appropriate udev rules."""
+assets = [
+    ["target/release/liquidmon", "usr/bin/", "755"],
+    ["resources/app.desktop", "usr/share/applications/com.github.cosmix.LiquidMon.desktop", "644"],
+    ["resources/app.metainfo.xml", "usr/share/appdata/com.github.cosmix.LiquidMon.metainfo.xml", "644"],
+    ["resources/icon.svg", "usr/share/icons/hicolor/scalable/apps/com.github.cosmix.LiquidMon.svg", "644"],
+    ["README.md", "usr/share/doc/liquidmon/README", "644"],
+]
 
 [dependencies]
 futures-util = "0.3.31"
