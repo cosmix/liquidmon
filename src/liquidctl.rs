@@ -33,10 +33,7 @@ pub struct Fan {
 #[derive(Debug)]
 pub enum Error {
     Spawn(io::Error),
-    NonZeroExit {
-        status: Option<i32>,
-        stderr: String,
-    },
+    NonZeroExit { status: Option<i32>, stderr: String },
     Parse(serde_json::Error),
     NoDevice,
     MissingField(&'static str),
@@ -48,16 +45,8 @@ impl fmt::Display for Error {
         match self {
             Error::Spawn(e) => write!(f, "failed to spawn liquidctl: {e}"),
             Error::NonZeroExit { status, stderr } => match status {
-                Some(code) => write!(
-                    f,
-                    "liquidctl exited with status {code}: {}",
-                    stderr.trim()
-                ),
-                None => write!(
-                    f,
-                    "liquidctl terminated by signal: {}",
-                    stderr.trim()
-                ),
+                Some(code) => write!(f, "liquidctl exited with status {code}: {}", stderr.trim()),
+                None => write!(f, "liquidctl terminated by signal: {}", stderr.trim()),
             },
             Error::Parse(e) => write!(f, "failed to parse liquidctl JSON output: {e}"),
             Error::NoDevice => write!(f, "no matching AIO device with usable status reported"),
@@ -286,9 +275,7 @@ mod tests {
         let raw = r#"[{"bus": "hid", "address": "/dev/hidraw1", "description": "Corsair Hydro H150i Pro XT", "status": [{"key": "Fan 1 speed", "value": 1000, "unit": "rpm"}, {"key": "Fan 1 duty", "value": 40, "unit": "%"}, {"key": "Pump speed", "value": 2334, "unit": "rpm"}, {"key": "Pump duty", "value": 75, "unit": "%"}]}]"#;
         match parse_status_response(raw) {
             Err(Error::MissingField("liquid temperature")) => {}
-            other => panic!(
-                "expected Error::MissingField(\"liquid temperature\"), got {other:?}"
-            ),
+            other => panic!("expected Error::MissingField(\"liquid temperature\"), got {other:?}"),
         }
     }
 

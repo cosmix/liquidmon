@@ -16,8 +16,7 @@ use std::collections::VecDeque;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-static AUTOSIZE_ID: LazyLock<widget::Id> =
-    LazyLock::new(|| widget::Id::new("liquidmon-applet"));
+static AUTOSIZE_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("liquidmon-applet"));
 
 const MAX_SAMPLES: usize = 60;
 const ICON_TEMP: &[u8] = include_bytes!("../resources/icons/temperature-symbolic.svg");
@@ -131,12 +130,9 @@ impl cosmic::Application for AppModel {
                     .width(Length::Fixed(36.0))
                     .height(Length::Fixed(16.0));
 
-                let coolant_glyph = row![
-                    symbolic_icon(ICON_SNOWFLAKE),
-                    symbolic_icon(ICON_TEMP),
-                ]
-                .spacing(1)
-                .align_y(Alignment::Center);
+                let coolant_glyph = row![symbolic_icon(ICON_SNOWFLAKE), symbolic_icon(ICON_TEMP),]
+                    .spacing(1)
+                    .align_y(Alignment::Center);
 
                 row![
                     coolant_glyph,
@@ -208,9 +204,8 @@ impl cosmic::Application for AppModel {
                 column.into()
             }
             (None, None) => {
-                let column = widget::list_column().add(widget::text::body(
-                    "Waiting for first reading…".to_string(),
-                ));
+                let column = widget::list_column()
+                    .add(widget::text::body("Waiting for first reading…".to_string()));
                 column.into()
             }
         };
@@ -228,21 +223,18 @@ impl cosmic::Application for AppModel {
         Subscription::batch(vec![
             // Poll liquidctl for status every 1500ms.
             Subscription::run_with("liquidctl-sub", |_| {
-                cosmic::iced::stream::channel(
-                    4,
-                    |mut channel: mpsc::Sender<Message>| async move {
-                        loop {
-                            let result = crate::liquidctl::fetch_status("Hydro")
-                                .await
-                                .map_err(|e| format!("{e}"));
-                            if channel.send(Message::StatusTick(result)).await.is_err() {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                cosmic::iced::stream::channel(4, |mut channel: mpsc::Sender<Message>| async move {
+                    loop {
+                        let result = crate::liquidctl::fetch_status("Hydro")
+                            .await
+                            .map_err(|e| format!("{e}"));
+                        if channel.send(Message::StatusTick(result)).await.is_err() {
+                            break;
                         }
-                        futures_util::future::pending().await
-                    },
-                )
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    futures_util::future::pending().await
+                })
             }),
             // Watch for application configuration changes.
             self.core()
@@ -283,20 +275,17 @@ impl cosmic::Application for AppModel {
                     };
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
-                    let mut popup_settings = self.core.applet.get_popup_settings(
-                        parent,
-                        new_id,
-                        None,
-                        None,
-                        None,
-                    );
+                    let mut popup_settings = self
+                        .core
+                        .applet
+                        .get_popup_settings(parent, new_id, None, None, None);
                     popup_settings.positioner.size_limits = Limits::NONE
                         .max_width(372.0)
                         .min_width(300.0)
                         .min_height(200.0)
                         .max_height(1080.0);
                     get_popup(popup_settings)
-                }
+                };
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
@@ -345,7 +334,10 @@ mod tests {
 
     #[test]
     fn fan_duty_avg_computes_integer_mean() {
-        assert_eq!(fan_duty_avg(&[fan(1, 40), fan(2, 50), fan(3, 60)]), Some(50));
+        assert_eq!(
+            fan_duty_avg(&[fan(1, 40), fan(2, 50), fan(3, 60)]),
+            Some(50)
+        );
     }
 
     #[test]
