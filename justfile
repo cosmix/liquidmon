@@ -64,6 +64,7 @@ vendor:
     cargo vendor --sync Cargo.toml | head -n -1 > .cargo/config.toml
     echo 'directory = "vendor"' >> .cargo/config.toml
     echo >> .cargo/config.toml
+    tar pcf vendor.tar vendor .cargo
     rm -rf .cargo vendor
 
 # Extracts vendored dependencies
