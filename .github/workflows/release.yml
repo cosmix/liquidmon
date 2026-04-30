@@ -48,10 +48,13 @@ jobs:
 
       - name: Verify .deb installs cleanly
         run: |
-          sudo dpkg -i target/debian/*.deb
+          # apt resolves the liquidctl dependency declared in Cargo.toml's
+          # [package.metadata.deb]; dpkg -i would fail since the runner
+          # doesn't ship liquidctl by default.
+          sudo apt-get install -y ./target/debian/*.deb
           dpkg -L liquidmon
           command -v liquidmon
-          sudo dpkg -r liquidmon
+          sudo apt-get remove -y liquidmon
 
       - name: Build tarball
         run: |
