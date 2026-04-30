@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(.work/**)",
+      "Write(.work/**)",
+      "Read(.claude/CLAUDE.md)",
+      "Read(~/.claude/CLAUDE.md)",
+      "Read(~/.claude/hooks/loom/**)",
+      "Bash(loom *)"
+    ]
+  }
+}
