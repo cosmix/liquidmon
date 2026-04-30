@@ -1,43 +1,19 @@
 # LiquidMon
 
 LiquidMon is a COSMIC panel applet that monitors Corsair Hydro AIO coolers in
-real time via the [`liquidctl`][liquidctl] CLI. The panel button displays the
-current liquid temperature, a rolling sparkline of recent temperature samples,
-average fan duty %, and pump duty %. Clicking the button opens a popup with the
-full device description, liquid temperature, pump speed and duty, and per-fan
+real time via the [`liquidctl`][liquidctl] CLI. The panel button shows the
+current liquid temperature, a rolling 90-second sparkline of recent samples,
+average fan duty %, and pump duty %. Clicking it opens a popup with the full
+device description, liquid temperature, pump speed and duty, and per-fan
 speed and duty for every fan the AIO reports.
 
-<!-- TODO: replace with an actual screenshot once the applet is running -->
-<!-- ![LiquidMon panel applet](docs/screenshot.png) -->
+The applet polls `liquidctl --json status` every 1.5 seconds with a 3-second
+per-call timeout. If a poll fails, the last successful reading is kept on
+display and the popup shows the underlying error — so a frozen temperature
+reading combined with an error in the popup means liquidctl has stopped
+responding.
 
-## Prerequisites
-
-- **COSMIC desktop** — stable release (Pop!\_OS 24.04 or any compatible distribution)
-- **`liquidctl`** — install via `pip install liquidctl` or your distro's package
-  manager (e.g. `sudo apt install liquidctl` on Ubuntu/Pop!\_OS)
-- **HID udev rules** — without these `liquidctl` requires `sudo` and the applet
-  will only ever show the `!` error state
-
-  Run the bundled script once to install the upstream udev rules and reload them:
-
-  ```sh
-  sudo ./scripts/install-liquidctl-udev.sh
-  ```
-
-  If `liquidctl status` still requires `sudo` after running the script,
-  unplug and replug the AIO's internal USB header (or reboot) to rebind
-  the `/dev/hidraw*` node under the new permissions.
-
-## Install
-
-```sh
-just build-release
-sudo just install
-```
-
-This installs the `liquidmon` binary to `/usr/bin/`, the `.desktop` launcher to
-`/usr/share/applications/`, the metainfo file to `/usr/share/appdata/`, and the
-icon to `/usr/share/icons/`.
+App ID: `com.github.cosmix.LiquidMon`
 
 ## Supported Devices
 
@@ -45,35 +21,113 @@ Any Corsair AIO whose `liquidctl status` description contains the word `Hydro`
 — for example: Hydro H100i, H115i, H150i Pro XT, H170i.
 
 > **Note:** the device match filter is currently hardcoded to `"Hydro"`.
-> Support for configuring the filter is a future feature.
+> Configurable matching is a future feature.
+
+## Install
+
+### From a release (recommended)
+
+Download the latest `.deb` from the [Releases][releases] page and install it
+with `apt`, which pulls in `liquidctl` (and its HID udev rules) as a
+dependency:
+
+```sh
+sudo apt install ./liquidmon_*.deb
+```
+
+If `/dev/hidraw*` nodes for the AIO already existed, replug the AIO's
+internal USB header (or reboot) so they pick up the new permissions.
+
+### From source
+
+Install the build dependencies (matches CI):
+
+```sh
+sudo apt install \
+    pkg-config \
+    libxkbcommon-dev \
+    libwayland-dev \
+    libfontconfig1-dev \
+    libfreetype6-dev \
+    liquidctl
+```
+
+A stable Rust toolchain is also required ([`rustup`][rustup]).
+
+Build and install:
+
+```sh
+cargo build --release
+sudo install -Dm0755 target/release/liquidmon /usr/bin/liquidmon
+sudo install -Dm0644 resources/app.desktop /usr/share/applications/com.github.cosmix.LiquidMon.desktop
+sudo install -Dm0644 resources/app.metainfo.xml /usr/share/appdata/com.github.cosmix.LiquidMon.metainfo.xml
+sudo install -Dm0644 resources/icon.svg /usr/share/icons/hicolor/scalable/apps/com.github.cosmix.LiquidMon.svg
+```
+
+If you have [`just`][just], `sudo just install` runs the four `install`
+commands above.
+
+### Uninstall
+
+```sh
+sudo apt remove liquidmon          # if installed via .deb
+sudo just uninstall                # if installed from source
+```
+
+## udev rules
+
+On Debian/Ubuntu the `liquidctl` apt package ships HID udev rules to
+`/lib/udev/rules.d/71-liquidctl.rules`, so installs that go through `apt`
+— including the `.deb` install path above — already have them.
+
+If liquidctl was installed another way and the applet shows `!`, install
+the upstream rules manually:
+
+```sh
+sudo ./scripts/install-liquidctl-udev.sh
+```
+
+Then replug the AIO's internal USB header (or reboot) so existing
+`/dev/hidraw*` nodes pick up the new permissions.
 
 ## Troubleshooting
 
-**Panel shows `!` (error state)**
+**Panel shows `!`**
 
-Run the following from a terminal to see the underlying error:
+The most recent `liquidctl` call failed. Reproduce the underlying error
+from a terminal:
 
 ```sh
 liquidctl --match Hydro --json status
 ```
 
-If the command requires `sudo`, the udev rules are missing or stale — re-run
-`sudo ./scripts/install-liquidctl-udev.sh` and replug the AIO's USB header.
+Common causes:
 
-**Panel shows `…` (waiting) for more than 5 seconds**
+- udev rules missing — see [udev rules](#udev-rules)
+- AIO unplugged or in a bad state
+- `liquidctl` not installed or not on `PATH`
 
-Check the COSMIC panel log for diagnostic messages:
+**Panel shows `…`**
+
+No reading has arrived yet. Polling runs every 1.5 seconds with a 3-second
+per-call timeout, so a steady `…` for more than 5 seconds means liquidctl
+is hanging or the subscription failed to start. Check the COSMIC panel log:
 
 ```sh
 journalctl --user -u cosmic-panel
 ```
 
+**Panel reading appears frozen**
+
+A stale reading is preserved when polls start failing. Open the popup — the
+underlying error is shown at the bottom.
+
 ## Development
 
 ```sh
-just run          # build release and run with RUST_BACKTRACE=full
-just check        # cargo clippy --all-features -W clippy::pedantic
-cargo test        # run unit tests
+cargo test                # run unit tests
+just check                # cargo clippy --all-features -- -W clippy::pedantic
+just run                  # build release and run with RUST_BACKTRACE=full
 ```
 
 Vendored offline builds:
@@ -84,7 +138,9 @@ just vendor && just build-vendored
 
 ## License
 
-MPL-2.0 — see `LICENSE` if/when one is added to the repository.
+MPL-2.0 — see `LICENSE`.
 
 [liquidctl]: https://github.com/liquidctl/liquidctl
 [just]: https://github.com/casey/just
+[rustup]: https://rustup.rs
+[releases]: https://github.com/cosmix/liquidmon/releases
