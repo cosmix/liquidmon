@@ -1,43 +1,90 @@
-# Cosmic Liquid
+# LiquidMon
 
-COSMIC panel applet for Corsair AIO temps and fan/pump duties via liquidctl
+LiquidMon is a COSMIC panel applet that monitors Corsair Hydro AIO coolers in
+real time via the [`liquidctl`][liquidctl] CLI. The panel button displays the
+current liquid temperature, a rolling sparkline of recent temperature samples,
+average fan duty %, and pump duty %. Clicking the button opens a popup with the
+full device description, liquid temperature, pump speed and duty, and per-fan
+speed and duty for every fan the AIO reports.
 
-## Installation
+<!-- TODO: replace with an actual screenshot once the applet is running -->
+<!-- ![LiquidMon panel applet](docs/screenshot.png) -->
 
-A [justfile](./justfile) is included by default for the [casey/just][just] command runner.
+## Prerequisites
 
-- `just` builds the application with the default `just build-release` recipe
-- `just run` builds and runs the application
-- `just install` installs the project into the system
-- `just vendor` creates a vendored tarball
-- `just build-vendored` compiles with vendored dependencies from that tarball
-- `just check` runs clippy on the project to check for linter warnings
-- `just check-json` can be used by IDEs that support LSP
+- **COSMIC desktop** — stable release (Pop!\_OS 24.04 or any compatible distribution)
+- **`liquidctl`** — install via `pip install liquidctl` or your distro's package
+  manager (e.g. `sudo apt install liquidctl` on Ubuntu/Pop!\_OS)
+- **HID udev rules** — without these `liquidctl` requires `sudo` and the applet
+  will only ever show the `!` error state
 
-## Translators
+  Run the bundled script once to install the upstream udev rules and reload them:
 
-[Fluent][fluent] is used for localization of the software. Fluent's translation files are found in the [i18n directory](./i18n). New translations may copy the [English (en) localization](./i18n/en) of the project, rename `en` to the desired [ISO 639-1 language code][iso-codes], and then translations can be provided for each [message identifier][fluent-guide]. If no translation is necessary, the message may be omitted.
+  ```sh
+  sudo ./scripts/install-liquidctl-udev.sh
+  ```
 
-## Packaging
+  If `liquidctl status` still requires `sudo` after running the script,
+  unplug and replug the AIO's internal USB header (or reboot) to rebind
+  the `/dev/hidraw*` node under the new permissions.
 
-If packaging for a Linux distribution, vendor dependencies locally with the `vendor` rule, and build with the vendored sources using the `build-vendored` rule. When installing files, use the `rootdir` and `prefix` variables to change installation paths.
+## Install
 
 ```sh
-just vendor
-just build-vendored
-just rootdir=debian/cosmic-liquid prefix=/usr install
+just build-release
+sudo just install
 ```
 
-It is recommended to build a source tarball with the vendored dependencies, which can typically be done by running `just vendor` on the host system before it enters the build environment.
+This installs the `liquidmon` binary to `/usr/bin/`, the `.desktop` launcher to
+`/usr/share/applications/`, the metainfo file to `/usr/share/appdata/`, and the
+icon to `/usr/share/icons/`.
 
-## Developers
+## Supported Devices
 
-Developers should install [rustup][rustup] and configure their editor to use [rust-analyzer][rust-analyzer].
+Any Corsair AIO whose `liquidctl status` description contains the word `Hydro`
+— for example: Hydro H100i, H115i, H150i Pro XT, H170i.
 
-[fluent]: https://projectfluent.org/
-[fluent-guide]: https://projectfluent.org/fluent/guide/hello.html
-[iso-codes]: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+> **Note:** the device match filter is currently hardcoded to `"Hydro"`.
+> Support for configuring the filter is a future feature.
+
+## Troubleshooting
+
+**Panel shows `!` (error state)**
+
+Run the following from a terminal to see the underlying error:
+
+```sh
+liquidctl --match Hydro --json status
+```
+
+If the command requires `sudo`, the udev rules are missing or stale — re-run
+`sudo ./scripts/install-liquidctl-udev.sh` and replug the AIO's USB header.
+
+**Panel shows `…` (waiting) for more than 5 seconds**
+
+Check the COSMIC panel log for diagnostic messages:
+
+```sh
+journalctl --user -u cosmic-panel
+```
+
+## Development
+
+```sh
+just run          # build release and run with RUST_BACKTRACE=full
+just check        # cargo clippy --all-features -W clippy::pedantic
+cargo test        # run unit tests
+```
+
+Vendored offline builds:
+
+```sh
+just vendor && just build-vendored
+```
+
+## License
+
+MPL-2.0 — see `LICENSE` if/when one is added to the repository.
+
+[liquidctl]: https://github.com/liquidctl/liquidctl
 [just]: https://github.com/casey/just
-[rustup]: https://rustup.rs/
-[rust-analyzer]: https://rust-analyzer.github.io/
-[sccache]: https://github.com/mozilla/sccache
