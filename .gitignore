@@ -26,3 +26,6 @@ debian/*
 
 # stray marker
 .codex
+
+# local-only helper scripts
+scripts/
