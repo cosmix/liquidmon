@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=LiquidMon
+Comment=COSMIC panel applet for Corsair AIO temps and fan/pump duties via liquidctl
+Type=Application
+Icon=com.github.cosmix.LiquidMon
+Exec=cosmic-liquid %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=COSMIC
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+MimeType=
