@@ -99,13 +99,7 @@ impl cosmic::Application for AppModel {
             config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
                 .map(|context| match Config::get_entry(&context) {
                     Ok(config) => config,
-                    Err((_errors, config)) => {
-                        // for why in errors {
-                        //     tracing::error!(%why, "error loading app config");
-                        // }
-
-                        config
-                    }
+                    Err((_errors, config)) => config,
                 })
                 .unwrap_or_default(),
             ..Default::default()
@@ -146,12 +140,12 @@ impl cosmic::Application for AppModel {
 
                 row![
                     coolant_glyph,
-                    self.core.applet.text(temp_text),
+                    self.core.applet.text(temp_text).font(cosmic::font::mono()),
                     sparkline,
                     symbolic_icon(ICON_FAN),
-                    self.core.applet.text(fan_text),
+                    self.core.applet.text(fan_text).font(cosmic::font::mono()),
                     symbolic_icon(ICON_PUMP),
-                    self.core.applet.text(pump_text),
+                    self.core.applet.text(pump_text).font(cosmic::font::mono()),
                 ]
                 .spacing(4)
                 .align_y(Alignment::Center)
@@ -179,20 +173,26 @@ impl cosmic::Application for AppModel {
                 let mut column = widget::list_column();
 
                 column = column.add(widget::text::heading(status.description.clone()));
-                column = column.add(widget::text::body(format!(
-                    "Liquid: {:.1} °C",
-                    status.liquid_temp_c
-                )));
-                column = column.add(widget::text::body(format!(
-                    "Pump   {} rpm   {}%",
-                    status.pump.speed_rpm, status.pump.duty_pct
-                )));
+                column = column.add(
+                    widget::text::body(format!("Liquid: {:.1} °C", status.liquid_temp_c))
+                        .font(cosmic::font::mono()),
+                );
+                column = column.add(
+                    widget::text::body(format!(
+                        "Pump   {} rpm   {}%",
+                        status.pump.speed_rpm, status.pump.duty_pct
+                    ))
+                    .font(cosmic::font::mono()),
+                );
 
                 for fan in &status.fans {
-                    column = column.add(widget::text::body(format!(
-                        "Fan {}  {} rpm   {}%",
-                        fan.index, fan.speed_rpm, fan.duty_pct
-                    )));
+                    column = column.add(
+                        widget::text::body(format!(
+                            "Fan {}  {} rpm   {}%",
+                            fan.index, fan.speed_rpm, fan.duty_pct
+                        ))
+                        .font(cosmic::font::mono()),
+                    );
                 }
 
                 if let Some(err) = maybe_err {
@@ -247,13 +247,7 @@ impl cosmic::Application for AppModel {
             // Watch for application configuration changes.
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
-                .map(|update| {
-                    // for why in update.errors {
-                    //     tracing::error!(?why, "app config error");
-                    // }
-
-                    Message::UpdateConfig(update.config)
-                }),
+                .map(|update| Message::UpdateConfig(update.config)),
         ])
     }
 
@@ -283,10 +277,14 @@ impl cosmic::Application for AppModel {
                 return if let Some(p) = self.popup.take() {
                     destroy_popup(p)
                 } else {
+                    let Some(parent) = self.core.main_window_id() else {
+                        self.popup = None;
+                        return Task::none();
+                    };
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
                     let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
+                        parent,
                         new_id,
                         None,
                         None,

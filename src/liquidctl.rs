@@ -5,6 +5,7 @@
 use serde::Deserialize;
 use std::fmt;
 use std::io;
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Parsed status snapshot for a single AIO device.
@@ -38,6 +39,8 @@ pub enum Error {
     },
     Parse(serde_json::Error),
     NoDevice,
+    MissingField(&'static str),
+    Timeout,
 }
 
 impl fmt::Display for Error {
@@ -58,6 +61,10 @@ impl fmt::Display for Error {
             },
             Error::Parse(e) => write!(f, "failed to parse liquidctl JSON output: {e}"),
             Error::NoDevice => write!(f, "no matching AIO device with usable status reported"),
+            Error::Timeout => write!(f, "liquidctl call timed out"),
+            Error::MissingField(field) => {
+                write!(f, "device found but missing required status field: {field}")
+            }
         }
     }
 }
@@ -106,10 +113,12 @@ struct StatusEntry {
 /// Runs `liquidctl --match <match_filter> --json status`, parses the first
 /// device with a non-empty `status` array, and returns its parsed AioStatus.
 pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
-    let output = Command::new("liquidctl")
-        .args(["--match", match_filter, "--json", "status"])
-        .output()
+    let mut cmd = Command::new("liquidctl");
+    cmd.args(["--match", match_filter, "--json", "status"])
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(3), cmd.output())
         .await
+        .map_err(|_| Error::Timeout)?
         .map_err(Error::Spawn)?;
 
     if !output.status.success() {
@@ -138,6 +147,10 @@ fn parse_status_response(raw: &str) -> Result<AioStatus, Error> {
         .find(|d| !d.status.is_empty())
         .ok_or(Error::NoDevice)?;
 
+    // Bounded casts: percentages clamp to 0–100; RPM/counts clamp to u32 domain.
+    let to_u8_pct = |v: f64| v.clamp(0.0, 100.0) as u8;
+    let to_u32 = |v: f64| v.clamp(0.0, u32::MAX as f64) as u32;
+
     let mut liquid_temp_c: Option<f64> = None;
     let mut pump_speed: Option<u32> = None;
     let mut pump_duty: Option<u8> = None;
@@ -152,15 +165,15 @@ fn parse_status_response(raw: &str) -> Result<AioStatus, Error> {
 
         match entry.key.as_str() {
             "Liquid temperature" => liquid_temp_c = Some(value_f64),
-            "Pump speed" => pump_speed = Some(value_f64 as u32),
-            "Pump duty" => pump_duty = Some(value_f64 as u8),
+            "Pump speed" => pump_speed = Some(to_u32(value_f64)),
+            "Pump duty" => pump_duty = Some(to_u8_pct(value_f64)),
             other => {
                 if let Some(rest) = other.strip_prefix("Fan ") {
                     if let Some((num, suffix)) = split_fan_key(rest) {
                         let slot = fans.entry(num).or_insert((None, None));
                         match suffix {
-                            "speed" => slot.0 = Some(value_f64 as u32),
-                            "duty" => slot.1 = Some(value_f64 as u8),
+                            "speed" => slot.0 = Some(to_u32(value_f64)),
+                            "duty" => slot.1 = Some(to_u8_pct(value_f64)),
                             _ => {}
                         }
                     }
@@ -170,9 +183,9 @@ fn parse_status_response(raw: &str) -> Result<AioStatus, Error> {
         }
     }
 
-    let liquid_temp_c = liquid_temp_c.ok_or(Error::NoDevice)?;
-    let pump_speed_rpm = pump_speed.ok_or(Error::NoDevice)?;
-    let pump_duty_pct = pump_duty.ok_or(Error::NoDevice)?;
+    let liquid_temp_c = liquid_temp_c.ok_or(Error::MissingField("liquid temperature"))?;
+    let pump_speed_rpm = pump_speed.ok_or(Error::MissingField("pump speed"))?;
+    let pump_duty_pct = pump_duty.ok_or(Error::MissingField("pump duty"))?;
 
     let mut fan_list: Vec<Fan> = fans
         .into_iter()
@@ -262,6 +275,20 @@ mod tests {
         match parse_status_response(raw) {
             Err(Error::NoDevice) => {}
             other => panic!("expected Error::NoDevice, got {other:?}"),
+        }
+    }
+
+    /// Device present with a non-empty status array, but the "Liquid temperature"
+    /// entry is absent — should surface as MissingField, not NoDevice.
+    #[test]
+    fn device_missing_liquid_temp_yields_missing_field() {
+        // Fixture is the H150i but with the Liquid temperature entry removed.
+        let raw = r#"[{"bus": "hid", "address": "/dev/hidraw1", "description": "Corsair Hydro H150i Pro XT", "status": [{"key": "Fan 1 speed", "value": 1000, "unit": "rpm"}, {"key": "Fan 1 duty", "value": 40, "unit": "%"}, {"key": "Pump speed", "value": 2334, "unit": "rpm"}, {"key": "Pump duty", "value": 75, "unit": "%"}]}]"#;
+        match parse_status_response(raw) {
+            Err(Error::MissingField("liquid temperature")) => {}
+            other => panic!(
+                "expected Error::MissingField(\"liquid temperature\"), got {other:?}"
+            ),
         }
     }
 }
