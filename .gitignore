@@ -27,5 +27,6 @@ debian/*
 # stray marker
 .codex
 
-# local-only helper scripts
-scripts/
+# local-only helper scripts (but ship the user-facing udev installer)
+scripts/*
+!scripts/install-liquidctl-udev.sh
