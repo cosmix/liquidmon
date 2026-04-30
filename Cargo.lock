@@ -921,20 +921,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-liquid"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "i18n-embed",
- "i18n-embed-fl",
- "libcosmic",
- "rust-embed",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "cosmic-panel-config"
 version = "0.1.0"
 source = "git+https://github.com/pop-os/cosmic-panel#d518c7d25ef96f1a9696aa8cce008656bf66ece4"
@@ -2767,6 +2753,20 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "liquidmon"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "libcosmic",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "litemap"

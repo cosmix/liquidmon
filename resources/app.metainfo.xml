@@ -5,15 +5,12 @@
   <project_license>MPL-2.0</project_license>
   <name>LiquidMon</name>
   <summary>COSMIC panel applet for Corsair AIO temps and fan/pump duties via liquidctl</summary>
-  <icon type="remote" width="64" height="64" scale="1">
-    https://github.com/cosmix/liquidmon/raw/main/resources/icons/hicolor/scalable/apps/icon.svg
-  </icon>
   <url type="vcs-browser">https://github.com/cosmix/liquidmon</url>
   <launchable type="desktop-id">com.github.cosmix.LiquidMon.desktop</launchable>
   <provides>
     <id>com.github.cosmix.LiquidMon</id>
     <binaries>
-      <binary>cosmic-liquid</binary>
+      <binary>liquidmon</binary>
     </binaries>
   </provides>
   <requires>

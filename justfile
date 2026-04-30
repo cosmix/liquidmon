@@ -1,4 +1,4 @@
-name := 'cosmic-liquid'
+name := 'liquidmon'
 appid := 'com.github.cosmix.LiquidMon'
 
 rootdir := ''
