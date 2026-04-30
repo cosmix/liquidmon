@@ -12,3 +12,17 @@ debian/*
 !debian/install
 !debian/rules
 !debian/source
+
+# loom workspace state
+.work/
+.work
+
+# loom worktrees
+.worktrees/
+.worktrees
+
+# Claude Code per-machine settings
+.claude/settings.local.json
+
+# stray marker
+.codex
