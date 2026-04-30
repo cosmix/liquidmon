@@ -82,14 +82,38 @@ Read files in this order to understand the codebase end-to-end:
 
 ## Test Coverage
 
-All tests are in `src/liquidctl.rs:226-294`. Four unit tests:
+Tests live in two `#[cfg(test)] mod tests` blocks: one at the bottom of `src/liquidctl.rs` and one at the bottom of `src/app.rs`. 30 unit tests total. Run with `cargo test`.
 
-- `parses_h150i_pro_xt_fixture` — full parse of a real device JSON snapshot for the Corsair Hydro H150i Pro XT; verifies temperature, pump, and all three fans
-- `empty_array_yields_no_device` — empty JSON array → `Error::NoDevice`
-- `all_devices_empty_status_yields_no_device` — multiple devices all with empty status arrays → `Error::NoDevice`
-- `device_missing_liquid_temp_yields_missing_field` — device present but missing liquid temperature key → `Error::MissingField("liquid temperature")`
+### `src/liquidctl.rs` — parser tests (20)
 
-Run with: `cargo test`
+Fixture and error-path coverage:
+
+- `parses_h150i_pro_xt_fixture` — full parse of a real H150i Pro XT JSON snapshot; verifies temperature, pump, and all three fans
+- `empty_array_yields_no_device`, `all_devices_empty_status_yields_no_device` — `Error::NoDevice` paths
+- `device_missing_liquid_temp_yields_missing_field`, `device_missing_pump_speed_yields_missing_field`, `device_missing_pump_duty_yields_missing_field` — required-field absence yields `Error::MissingField(<name>)`
+- `fan_with_only_speed_is_dropped`, `fan_with_only_duty_is_dropped` — fans missing one of speed/duty are filtered out (filter at `liquidctl.rs:190-200`)
+- `fan_index_zero_is_ignored` — `Fan 0` keys silently dropped per `split_fan_key`
+- `fans_emerge_sorted_by_index` — shuffled-input fans come out ordered (BTreeMap + explicit sort)
+- `out_of_range_pump_duty_is_clamped`, `negative_values_clamp_to_zero` — `to_u8_pct`/`to_u32` bounds
+- `first_device_with_status_is_selected` — multi-device selection picks first non-empty `status`
+- `unknown_keys_are_silently_ignored` — extraneous keys (e.g. `Firmware version`) don't break parsing
+- `malformed_json_yields_parse_error` — invalid JSON → `Error::Parse`
+- `split_fan_key_extracts_index_and_suffix`, `split_fan_key_rejects_zero_and_malformed` — direct unit tests of the private helper
+- `display_includes_field_name_for_missing_field`, `display_for_no_device_and_timeout` — `Display` impl smoke tests
+- `error_source_chains_for_inner_io_and_parse` — `std::error::Error::source()` chains for `Spawn`/`Parse`, returns `None` for `NoDevice`/`MissingField`/`Timeout`
+
+### `src/app.rs` — model tests (10)
+
+Helper and `update()` state-transition tests. The test module imports `cosmic::Application as _` to bring the trait method `update` into scope, and constructs `AppModel` via `AppModel::default()` (which works because `cosmic::Core: Default` and all other fields derive `Default`):
+
+- `fan_duty_avg_is_none_for_empty`, `fan_duty_avg_computes_integer_mean`, `fan_duty_avg_truncates_toward_zero`, `fan_duty_avg_at_max` — pure helper at `app.rs:34-40`
+- `status_tick_ok_appends_temp_and_clears_error` — `StatusTick(Ok)` pushes to `temp_history`, sets `last_status`, clears `last_error`
+- `status_tick_err_preserves_stale_status` — `StatusTick(Err)` sets `last_error` but does NOT clear `last_status` (the deliberate stale-data design at `app.rs:274`)
+- `temp_history_caps_at_max_samples` — pushing `MAX_SAMPLES + 10` samples leaves exactly `MAX_SAMPLES = 60`, with the oldest dropped from the front
+- `popup_closed_with_matching_id_clears_popup`, `popup_closed_with_non_matching_id_is_noop` — `PopupClosed(Id)` only clears when the id matches
+- `update_config_replaces_config` — `UpdateConfig(Config)` arm runs without disturbing other state
+
+Not covered: `view`/`view_window` rendering, `subscription`, the `TogglePopup` arm (touches `core.main_window_id()`), and `fetch_status`'s subprocess invocation (only the pure `parse_status_response` is exercised).
 
 ## Build and Development Workflow
 
@@ -122,3 +146,36 @@ just install rootdir=$HOME/.local
 - COSMIC config storage path (managed by libcosmic/cosmic-settings-daemon)
 
 Changing the app ID requires updating all four locations plus reinstalling.
+
+## CI/CD Entry Points
+
+The workflow files exist only in git history (committed in `6f9b43b`, not currently on-disk). To review them:
+
+```text
+git show 6f9b43b:.github/workflows/ci.yml
+git show 6f9b43b:.github/workflows/release.yml
+```
+
+New contributors should understand:
+
+- CI runs on push to `main` and all PRs — fmt, clippy (pedantic, warnings-as-errors), test, release build
+- Releases are tag-driven: push `v*` tag → `.deb` + tarball + SHA256SUMS → GitHub release
+- Use `just tag <version>` to bump version, commit, and tag in one step
+
+## Resources Directory — Complete File List
+
+```text
+resources/
+├── app.desktop          # XDG desktop entry (installed to share/applications/)
+├── app.metainfo.xml     # AppStream metadata (installed to share/appdata/)
+├── icon.svg             # Main app icon (installed to hicolor/scalable/apps/)
+└── icons/
+    ├── fan-symbolic.svg          # Fan speed symbolic icon
+    ├── pump-symbolic.svg         # Pump duty symbolic icon
+    ├── snowflake-symbolic.svg    # Cooling indicator symbolic icon
+    └── temperature-symbolic.svg  # Temperature symbolic icon
+```
+
+The four symbolic icons in `resources/icons/` are the COSMIC-style inline icons embedded in the applet's panel button and popup widget. They follow the freedesktop symbolic icon naming convention (suffix `-symbolic`).
+
+The `resources/icon.svg` (app icon) is embedded via the `appid` variable in justfile: installed as `com.github.cosmix.LiquidMon.svg`.

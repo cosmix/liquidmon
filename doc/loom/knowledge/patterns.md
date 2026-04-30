@@ -189,3 +189,104 @@ Phase 1: deserialize to `Vec<DeviceEntry>` (private structs). Phase 2: iterate `
 ### BTreeMap for ordered fan accumulation (liquidctl.rs:158-200)
 
 `BTreeMap` is chosen over `HashMap` so fans are naturally ordered by index during `.into_iter()`, avoiding an explicit sort (though an explicit `.sort_by_key` is still called as belt-and-suspenders at liquidctl.rs:201).
+
+## Sparkline Canvas Widget (src/sparkline.rs)
+
+`Sparkline` is a struct holding `samples: Vec<f64>` constructed from any `IntoIterator<Item = f64>` (sparkline.rs:9-18). It implements `canvas::Program<Message, Theme>` with `type State = ()` — no mutable canvas state (sparkline.rs:21-22).
+
+The `draw` method (sparkline.rs:24-71):
+
+- Returns early with an empty frame if fewer than 2 samples are available (sparkline.rs:34-36).
+- Uses a **fixed y-axis domain** of 10–40 °C (const Y_MIN/Y_MAX), intentionally not auto-scaled to the sample range. Values outside this band visually pin at the top or bottom edge — a deliberate design choice documented with a comment (sparkline.rs:38-42).
+- Computes a 1 px `pad` on each edge; `usable_w` and `usable_h` clamp to at least 1.0 via `.max(1.0)` (sparkline.rs:46-48).
+- Maps sample index `i` to x: `pad + (i / (n-1)) * usable_w`; maps sample value to y: `pad + (1 - norm) * usable_h`, where `norm = (sample - Y_MIN) / range` and y is inverted so higher values render higher in the frame (sparkline.rs:51-61).
+- Builds a `Path` via `Path::new(|p| { ... })` using `p.move_to` for the first point and `p.line_to` for subsequent points (sparkline.rs:50-62).
+- Strokes the path with `Color::from_rgba8(180, 200, 230, 0.85)` (light blue, slightly transparent) at width 1.5 (sparkline.rs:64-68).
+- Returns `vec\![frame.into_geometry()]` — single geometry element per draw call.
+
+The widget is embedded in `view()` as `Canvas::new(Sparkline::new(...))` with explicit `.width(Length::Fixed(36.0)).height(Length::Fixed(16.0))` (app.rs:130-132).
+
+## LazyLock for Stable Widget IDs (src/app.rs:19-20)
+
+```rust
+static AUTOSIZE_ID: LazyLock<widget::Id> =
+    LazyLock::new(|| widget::Id::new("liquidmon-applet"));
+```
+
+`widget::Id` is not `const`-constructible; a `static LazyLock` initialises it once on first access. The same `AUTOSIZE_ID.clone()` is passed to `autosize::autosize(button, AUTOSIZE_ID.clone())` (app.rs:164) every render cycle, giving the autosize wrapper a stable identity across redraws. Using `LazyLock` (from `std::sync`) is preferred over `once_cell::sync::Lazy` — no third-party dependency needed.
+
+## include_bytes\! for Embedded SVG Icons (src/app.rs:23-26)
+
+```rust
+const ICON_TEMP: &[u8]      = include_bytes\!("../resources/icons/temperature-symbolic.svg");
+const ICON_SNOWFLAKE: &[u8] = include_bytes\!("../resources/icons/snowflake-symbolic.svg");
+const ICON_FAN: &[u8]       = include_bytes\!("../resources/icons/fan-symbolic.svg");
+const ICON_PUMP: &[u8]      = include_bytes\!("../resources/icons/pump-symbolic.svg");
+```
+
+SVG icon files are embedded at compile time as `&'static [u8]` constants via `include_bytes\!`. This avoids runtime filesystem access and ensures icons are always available. The path is relative to `src/app.rs`, so the macro resolves to `resources/icons/` at the crate root.
+
+## symbolic_icon() Helper (src/app.rs:28-32)
+
+```rust
+fn symbolic_icon(bytes: &'static [u8]) -> widget::icon::Icon {
+    let mut handle = widget::icon::from_svg_bytes(bytes);
+    handle.symbolic = true;
+    widget::icon::icon(handle).size(14)
+}
+```
+
+Takes a `&'static [u8]` (an embedded SVG), creates a mutable icon handle via `widget::icon::from_svg_bytes`, sets `handle.symbolic = true` so the icon is recoloured to match the panel text colour (COSMIC symbolic icon convention), then wraps it in a `widget::icon::icon(handle).size(14)` widget. All four icons (temperature, snowflake, fan, pump) are rendered this way.
+
+## fan_duty_avg() Computation (src/app.rs:34-40)
+
+```rust
+fn fan_duty_avg(fans: &[crate::liquidctl::Fan]) -> Option<u8> {
+    if fans.is_empty() {
+        return None;
+    }
+    let sum: u32 = fans.iter().map(|f| u32::from(f.duty_pct)).sum();
+    Some((sum / fans.len() as u32) as u8)
+}
+```
+
+Returns `None` if the fan slice is empty (no fans reported). Otherwise widens `duty_pct: u8` to `u32` before summing to avoid overflow on realistic fan counts, then performs integer division by `fans.len() as u32` and casts back to `u8`. No rounding — truncating integer division. Called in `view()` to produce the panel fan% label; a `None` result renders as `"—"` (app.rs:124-127).
+
+## get_popup SctkPopupSettings (src/app.rs:276-298)
+
+The `TogglePopup` arm calls `self.core.applet.get_popup_settings(parent, new_id, None, None, None)` to build default settings, then immediately overrides `popup_settings.positioner.size_limits`:
+
+```rust
+popup_settings.positioner.size_limits = Limits::NONE
+    .max_width(372.0)
+    .min_width(300.0)
+    .min_height(200.0)
+    .max_height(1080.0);
+```
+
+All three `Option` arguments to `get_popup_settings` are `None` (letting the COSMIC runtime choose anchor, gravity, and offset). The `Limits` chain starts from `Limits::NONE` (unbounded) and then layers specific min/max bounds. After mutation, `get_popup(popup_settings)` (imported from `cosmic::iced::platform_specific::shell::wayland::commands::popup`) is returned as the `Task`.
+
+## style() Trait Method (src/app.rs:310-312)
+
+`AppModel` also implements the optional `style()` method of `cosmic::Application`:
+
+```rust
+fn style(&self) -> Option<cosmic::iced::theme::Style> {
+    Some(cosmic::applet::style())
+}
+```
+
+This hooks the COSMIC applet styling (transparent panel background, appropriate borders) into the iced theme system. Without this the applet would use the default iced window style.
+
+## MAX_SAMPLES Ring-Buffer Cap (src/app.rs:22, 265-268)
+
+`const MAX_SAMPLES: usize = 60` limits `temp_history: VecDeque<f64>` to 60 entries (approximately 90 seconds of history at the 1500 ms poll interval). The cap is enforced in `update()` with:
+
+```rust
+self.temp_history.push_back(status.liquid_temp_c);
+while self.temp_history.len() > MAX_SAMPLES {
+    self.temp_history.pop_front();
+}
+```
+
+`VecDeque::pop_front` efficiently removes the oldest entry. The `while` loop (rather than `if`) is defensive against any future batch-insert path.

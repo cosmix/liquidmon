@@ -200,3 +200,146 @@ The stale-data preservation design is intentional and correct — users see rece
 | `liquidctl.rs` | Subprocess invocation and JSON parsing             | `liquidctl` process via stdin/stdout  |
 | `sparkline.rs` | Iced Canvas widget for temperature sparkline       | None                                  |
 | `config.rs`    | Config schema declaration only                     | cosmic-config/dbus (via libcosmic)    |
+
+## CI/CD Pipeline
+
+`.github/workflows/ci.yml` — triggered on every push to `main` and every pull request. Concurrency group cancels in-progress PR runs on new pushes (`cancel-in-progress: ${{ github.event_name == 'pull_request' }}`). Runs on `ubuntu-24.04`.
+
+Single job `check` (fmt / clippy / test / build):
+
+1. Install system deps: `pkg-config`, `libxkbcommon-dev`, `libwayland-dev`, `libfontconfig1-dev`, `libfreetype6-dev`
+2. `dtolnay/rust-toolchain@stable` with `rustfmt` and `clippy` components
+3. `Swatinem/rust-cache@v2` for dependency caching
+4. `cargo fmt --all -- --check`
+5. `cargo clippy --all-targets --all-features -- -D warnings` (all warnings are errors via `RUSTFLAGS: -D warnings`)
+6. `cargo test --all-features --no-fail-fast`
+7. `cargo build --release`
+
+## Release Workflow
+
+`.github/workflows/release.yml` — triggered on `v*` tag pushes. Requires `permissions: contents: write` for GitHub release creation.
+
+Single job `build` (.deb + tarball):
+
+1. Same system deps + toolchain + cache as CI
+2. `cargo install cargo-deb --locked` — installs the Debian packager
+3. `cargo build --release --locked` then `strip target/release/liquidmon`
+4. `cargo deb --no-build --no-strip` — generates `.deb` from `[package.metadata.deb]` in `Cargo.toml`
+5. Smoke-test: `sudo dpkg -i target/debian/*.deb`, `dpkg -L liquidmon`, `command -v liquidmon`, `sudo dpkg -r liquidmon`
+6. Tarball: strips `v` from tag → `liquidmon-<version>-x86_64-linux/` with binary + `resources/` + `justfile` + `README.md`, then `tar -czf`
+7. `sha256sum *.tar.gz *.deb > SHA256SUMS`
+8. `softprops/action-gh-release@v2` uploads `.tar.gz`, `.deb`, `SHA256SUMS`; sets `generate_release_notes: true`
+
+## cargo-deb Integration (Cargo.toml)
+
+`Cargo.toml` contains `[package.metadata.deb]` (lines 10-26) consumed by `cargo-deb` during releases:
+
+- `maintainer`, `section = "utility"`, `priority = "optional"`
+- `depends = "$auto, liquidctl"` — auto-detects Rust runtime deps and adds explicit `liquidctl` dep
+- `extended-description` explaining udev rule requirement
+- `assets` array maps: binary→`usr/bin/`, desktop→`usr/share/applications/`, metainfo→`usr/share/appdata/`, icon→`usr/share/icons/hicolor/scalable/apps/`, `README.md`→`usr/share/doc/liquidmon/README`
+
+## libcosmic Dependency Pinning
+
+`libcosmic` is sourced directly from git (`pop-os/libcosmic`) pinned to commit `564ef834cec33a948dc10c9b401cf29db5d18373` (`Cargo.toml:35-37`). Features enabled: `applet`, `applet-token`, `dbus-config`, `multi-window`, `tokio`, `wayland`, `winit`. No registry version is used — upstream does not publish to crates.io.
+
+## Cargo Edition and No Profiles
+
+`Cargo.toml` uses `edition = "2024"` (Rust 2024 edition). There are no custom `[profile.*]` sections; release builds use Cargo defaults.
+
+## Desktop Entry Fields
+
+`resources/app.desktop` notable fields beyond name/icon/exec:
+
+- `NoDisplay=true` — hides applet from standard application launchers
+- `X-CosmicApplet=true` — COSMIC-specific key marking it as a panel applet
+- `X-CosmicHoverPopup=Auto` — controls hover popup behavior in the COSMIC panel
+- `StartupNotify=true`, `Terminal=false`, `Categories=COSMIC`, `MimeType=` (explicitly empty)
+
+## AppStream Metadata
+
+`resources/app.metainfo.xml` (AppStream/Flathub standard):
+
+- `metadata_license: CC0-1.0`, `project_license: MPL-2.0`
+- `<url type="vcs-browser">https://github.com/cosmix/liquidmon</url>`
+- `<requires><display_length compare="ge">360</display_length></requires>` — minimum display width
+- `<supports>`: keyboard, pointing, touch controls
+- `<content_rating type="oars-1.1" />` — OARS content rating (empty = no objectionable content)
+- `<provides><binaries><binary>liquidmon</binary></binaries></provides>`
+
+## Icon
+
+`resources/icon.svg` is a stub: a 128×128 empty `<svg>` element with no path data (2 lines). The four symbolic panel icons (`fan-symbolic.svg`, `pump-symbolic.svg`, `snowflake-symbolic.svg`, `temperature-symbolic.svg`) live under `resources/icons/` and are what actually appear in the panel UI.
+
+## Justfile Additional Targets
+
+Targets not previously documented:
+
+- `clean` — `cargo clean`
+- `clean-vendor` — removes `.cargo/` and `vendor/` and `vendor.tar`
+- `clean-dist` — runs both `clean` and `clean-vendor`
+- `build-debug *args` — `cargo build` (debug profile)
+- `check-json` — runs clippy with `--message-format=json` (for editor tooling)
+- `uninstall` — removes binary, desktop, and icon from installed paths (does NOT remove metainfo)
+- `vendor` — runs `cargo vendor`, pipes source replacement config into `.cargo/config.toml`, archives everything into `vendor.tar`, then removes `.cargo/` and `vendor/` (the archive is the artifact)
+- `vendor-extract` — extracts `vendor.tar` back to `vendor/` and `.cargo/`
+- `tag <version>` — sed-patches all `Cargo.toml` `version =` lines, runs `cargo check` + `cargo clean`, stages `Cargo.lock`, creates a `release: <version>` commit, and creates an annotated git tag
+
+## doc/plans Directory
+
+`doc/plans/` exists but is currently empty — no active plans.
+
+## .cargo Directory
+
+No `.cargo/config.toml` is checked into the repo. It is generated transiently by `just vendor` and included inside `vendor.tar`; it is absent from the working tree when not using vendored builds.
+
+## Debian Packaging via cargo-deb (Cargo.toml:10-26)
+
+`[package.metadata.deb]` wires up `cargo-deb` as the authoritative packaging source. Key fields:
+
+- `depends = "$auto, liquidctl"` — `$auto` resolves shared-library deps at package time; `liquidctl` is declared as an explicit runtime dep, so `.deb` consumers get it automatically
+- `assets` list mirrors the `just install` paths exactly; if either diverges, the install is inconsistent
+- `extended-description` re-states the udev/liquidctl prerequisite for software-center consumers
+- `priority = "optional"`, `section = "utility"` — standard Debian classification
+
+The release workflow uses `cargo install cargo-deb` then `cargo deb --no-build` (since the binary is already stripped) to produce the `.deb` artifact.
+
+## Sparkline Fixed Temperature Scale (src/sparkline.rs:41-42)
+
+The sparkline Y-axis is hardcoded to `[10.0, 40.0]` °C — it does NOT auto-scale to data. Any reading above 40 °C pins at the top edge without visual distinction. This is a soft limit; real AIO liquid temps rarely exceed 40 °C under normal load, but the limitation is invisible to the user and creates false-flat sparklines during thermal events.
+
+## Icon Situation: Stub vs. Symbolic Set
+
+- `resources/icon.svg` — the application icon installed to `hicolor/scalable/apps/`. Currently an empty 128×128 SVG stub with no paths. The `.deb` and `just install` both deploy it.
+- `resources/icons/` — four symbolic SVGs actually used in the panel UI, embedded via `include_bytes\!`:
+  - `fan-symbolic.svg` (ICON_FAN, app.rs:25)
+  - `pump-symbolic.svg` (ICON_PUMP, app.rs:26)
+  - `snowflake-symbolic.svg` (ICON_SNOWFLAKE, app.rs:24)
+  - `temperature-symbolic.svg` (ICON_TEMP, app.rs:23)
+
+These symbolic icons are themed/recoloured by the COSMIC compositor (via `symbolic = true` flag in `symbolic_icon()`), while the stub app icon means the applet has no distinct launcher icon in software centers.
+
+## CI/CD Architecture (git history: commit 6f9b43b)
+
+The `.github/workflows/` directory exists in git history but is NOT present in the working tree. The workflows are:
+
+### ci.yml
+
+- Trigger: push to `main`, PRs (with concurrency cancel-in-progress)
+- Runner: `ubuntu-24.04`
+- Toolchain: `dtolnay/rust-toolchain@stable` (floating, not pinned to a version)
+- Cache: `Swatinem/rust-cache@v2`
+- Steps in order: `cargo fmt --check` → `cargo clippy` (with `RUSTFLAGS=-D warnings`) → `cargo test` → `cargo build --release`
+
+### release.yml
+
+- Trigger: tags matching `v*`
+- Steps: install `cargo-deb` → `cargo build --release` → strip binary → `cargo deb --no-build` → smoke-test install/uninstall → create `liquidmon-<version>-x86_64-linux.tar.gz` + `SHA256SUMS` → upload all artifacts via `softprops/action-gh-release@v2`
+
+## Release Artifact Set
+
+A tagged release produces three artifacts uploaded to GitHub Releases:
+
+1. `liquidmon_<version>_amd64.deb` — installable Debian package (includes `liquidctl` dep)
+2. `liquidmon-<version>-x86_64-linux.tar.gz` — raw tarball (binary + desktop + icon + metainfo)
+3. `SHA256SUMS` — checksums for both archives
