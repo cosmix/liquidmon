@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "liquidmon") | .version')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME implies version $tag_version, but Cargo.toml is $cargo_version"
+            exit 1
+          fi
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
