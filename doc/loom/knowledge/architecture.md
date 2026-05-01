@@ -52,24 +52,39 @@ Panel button is rendered by `view()` (src/app.rs:120-165); popup overlay by `vie
 
 ## AppModel State Structure
 
-`src/app.rs:44-58`
+`src/app.rs:87-115`
 
 ```text
 AppModel {
-    core:         cosmic::Core           // COSMIC runtime handle
-    popup:        Option<Id>             // Some(id) when popup is open
-    config:       Config                 // Persisted config (cosmic_config)
-    last_status:  Option<AioStatus>      // Most-recent successful liquidctl read
-    last_error:   Option<String>         // Most-recent error (kept even with stale data)
-    temp_history: VecDeque<f64>          // Liquid temp samples for panel sparkline (cap: MAX_SAMPLES=60)
+    core:                  cosmic::Core           // COSMIC runtime handle
+    popup:                 Option<Id>             // Some(id) when popup is open
+    config:                Config                 // Persisted config (cosmic_config)
+    config_handle:         Option<cosmic_config::Config>  // kept alive for write_entry
+    pending_interval_secs: Option<f32>            // slider drag value (None outside drag)
+    last_status:           Option<AioStatus>      // Most-recent successful liquidctl read
+    last_error:            Option<String>         // Most-recent error (kept even with stale data)
+    temp_history:          VecDeque<f64>          // Liquid temp samples (cap: HISTORY_CAP=900)
+    pump_duty_history:     VecDeque<f64>          // Pump duty % samples (popup sparkline)
+    fan_avg_duty_history:  VecDeque<f64>          // Mean fan duty % (popup sparkline)
 }
 ```
 
-`MAX_SAMPLES = 60` at `src/app.rs:22`. At 1500 ms per sample, this covers ~90 s of history. On a poll error, `last_status` is intentionally NOT cleared (src/app.rs:268), so the UI can show stale readings alongside the error badge.
+The popup renders three large 80 px sparklines (coolant temperature, pump duty, fan-average duty); pump speed and per-fan speed are surfaced as numeric labels next to the matching sparkline rather than as separate canvases.
+
+Constants at `src/app.rs:21-24`:
+
+```text
+PANEL_SPARK_SAMPLES = 60    — trailing-N window fed to the panel button sparkline
+HISTORY_CAP         = 900   — maximum samples in every per-metric VecDeque (~15 min at 1 s)
+MIN_INTERVAL_MS     = 1000  — lower bound for the user-configurable sample interval
+MAX_INTERVAL_MS     = 10000 — upper bound for the user-configurable sample interval
+```
+
+On a poll error, `last_status` is intentionally NOT cleared (src/app.rs:332-334), so the UI can show stale readings alongside the error badge.
 
 ## Message/Event Types and Flow
 
-Defined at `src/app.rs:61-67`:
+Defined at `src/app.rs:121-130`:
 
 ```text
 Message::TogglePopup             — panel button click → open/close popup window
@@ -77,6 +92,9 @@ Message::PopupClosed(Id)         — Wayland compositor closed popup externally
 Message::UpdateConfig(Config)    — cosmic_config watch fired a new config value
 Message::StatusTick(Result<AioStatus, String>)
                                  — background subscription delivered a liquidctl result
+Message::SampleIntervalDragged(f32)
+                                 — fires every drag tick; updates pending_interval_secs only
+Message::SampleIntervalReleased  — fires once on slider release; commits and persists the interval
 ```
 
 All messages route through `AppModel::update` (src/app.rs:253-302):
@@ -90,8 +108,8 @@ All messages route through `AppModel::update` (src/app.rs:253-302):
 ## Data Flow: liquidctl subprocess → UI
 
 ```text
-Subscription::run_with("liquidctl-sub", …)    [src/app.rs:224]
-  └─ infinite async loop every 1500 ms
+Subscription::run_with(interval_ms, …)    [src/app.rs:276]
+  └─ infinite async loop every config.sample_interval_ms (default 1500 ms)
        └─ liquidctl::fetch_status("Hydro")     [src/liquidctl.rs:115]
             └─ tokio::process::Command::new("liquidctl")
                  .args(["--match", "Hydro", "--json", "status"])
@@ -139,7 +157,17 @@ Error hierarchy (`src/liquidctl.rs:33-44`):
 
 ## Configuration System
 
-`src/config.rs:5-7` — `Config` derives `CosmicConfigEntry` with `#[version = 1]`. The struct body is empty (`pub struct Config {}`); the `CosmicConfigEntry` derive accepts an empty struct. Config is loaded in `AppModel::init` via `cosmic_config::Config::new(APP_ID, Config::VERSION)` and hot-reloaded via `core().watch_config::<Config>(APP_ID)` subscription (`src/app.rs:241-244`). On load error the framework-provided partial config is used rather than panicking.
+`src/config.rs:5-17` — `Config` derives `CosmicConfigEntry` with `#[version = 2]`. It carries one field:
+
+```rust
+pub struct Config {
+    pub sample_interval_ms: u64,
+}
+```
+
+`Default` is hand-implemented (not derived) returning `sample_interval_ms: 1500`. The explicit `Default` is required because `#[derive(Default)]` was dropped when the non-default field was added; it also ensures that `CosmicConfigEntry::get_entry`'s field-by-field fallback picks up 1500 ms automatically when upgrading from a v1 config file that has no `sample_interval_ms` key.
+
+Config is loaded in `AppModel::init` (`src/app.rs:161-168`) by constructing a single `cosmic_config::Config` handle, reading the entry from it, and storing both the parsed `Config` and the raw handle in `AppModel` (`config_handle`). Keeping the handle alive is required for `config.write_entry(&handle)` later. Hot-reload via `core().watch_config::<Config>(APP_ID)` subscription remains unchanged (`src/app.rs:293-296`). On load error the framework-provided partial config is used rather than panicking.
 
 APP_ID: `"com.github.cosmix.LiquidMon"` (`src/app.rs:81`)
 
@@ -174,14 +202,13 @@ Installed paths use RDNN `com.github.cosmix.LiquidMon`. Vendored dependency work
 
 ## Cross-Cutting Concerns Synthesis
 
-### The "No Real Config" Gap
+### The "Partially Hardcoded Config" Gap
 
-The configuration infrastructure (`src/config.rs`, `src/app.rs:97-108`, `src/app.rs:241-244`) is fully wired for hot-reload, but the `Config` struct is empty. Two critical runtime behaviors are therefore hardcoded outside the config system:
+The configuration infrastructure is fully wired. One runtime behavior remains hardcoded outside the config system:
 
-- Device match filter: `"Hydro"` at `src/app.rs:229`
-- Poll interval: `1500 ms` at `src/app.rs:235`
+- Device match filter: `"Hydro"` at `src/app.rs:280` — not derived from `Config`; cannot be changed without recompiling.
 
-When these are moved to `Config`, the subscription closure in `src/app.rs:222-246` must receive them as captured values.
+The poll interval is no longer hardcoded: it is stored in `Config.sample_interval_ms` (default 1500 ms), user-settable via the slider in the popup, and persisted via `config.write_entry`. The subscription re-keys on the clamped interval so the poll loop restarts only on slider release (`src/app.rs:271-298`).
 
 ### Reliability Chain from Poll to Display
 

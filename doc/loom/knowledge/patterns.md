@@ -76,9 +76,12 @@ All application state lives in one struct with six fields:
 - `core: cosmic::Core` — runtime-managed, accessed via required trait methods
 - `popup: Option<Id>` — popup window identity, `None` when closed
 - `config: Config` — persisted config reloaded via subscription
+- `config_handle: Option<cosmic_config::Config>` — raw handle kept alive for `write_entry`
+- `pending_interval_secs: Option<f32>` — transient slider value during drag (`None` outside drag)
 - `last_status: Option<AioStatus>` — last successful poll result
 - `last_error: Option<String>` — last error string, coexists with `last_status`
-- `temp_history: VecDeque<f64>` — liquid temp samples for sparkline, capped at `MAX_SAMPLES = 60`
+- `temp_history: VecDeque<f64>` — liquid temp samples, capped at `HISTORY_CAP = 900`
+- `pump_duty_history`, `fan_avg_duty_history: VecDeque<f64>` — duty histories rendered as 80 px popup sparklines (same cap; speed values are shown as numeric labels, not sparklines)
 
 `#[derive(Default)]` is present so `init` can use struct update syntax (`..Default::default()`).
 
@@ -104,7 +107,7 @@ This pattern encodes "stale + error" distinctly from "no data + error".
 
 The subscription uses `Subscription::batch` containing two subscriptions:
 
-1. **liquidctl poll** (`app.rs:224-240`): `Subscription::run_with("liquidctl-sub", ...)` wraps `cosmic::iced::stream::channel(4, ...)` — a channel with buffer size 4. The async closure runs an infinite loop: call `fetch_status`, send result, sleep 1500 ms. If the send fails (channel closed), it breaks and then awaits `futures_util::future::pending()` to keep the future alive.
+1. **liquidctl poll** (`app.rs:276-290`): `Subscription::run_with(interval_ms, fn_ptr)` wraps `cosmic::iced::stream::channel(4, ...)` — a channel with buffer size 4. The async closure runs an infinite loop: call `fetch_status`, send result, sleep `config.sample_interval_ms` (default 1500, user-configurable). If the send fails (channel closed), it breaks and then awaits `futures_util::future::pending()` to keep the future alive. The subscription identity includes `interval_ms`, so changing the configured interval tears down and restarts the poll loop.
 
 2. **Config watch** (`app.rs:241-244`): `self.core().watch_config::<Config>(APP_ID).map(...)` maps config update events to `Message::UpdateConfig`.
 
@@ -294,15 +297,93 @@ fn style(&self) -> Option<cosmic::iced::theme::Style> {
 
 This hooks the COSMIC applet styling (transparent panel background, appropriate borders) into the iced theme system. Without this the applet would use the default iced window style.
 
-## MAX_SAMPLES Ring-Buffer Cap (src/app.rs:22, 265-268)
+## History Ring-Buffer Cap (src/app.rs:21-24, 55-59)
 
-`const MAX_SAMPLES: usize = 60` limits `temp_history: VecDeque<f64>` to 60 entries (approximately 90 seconds of history at the 1500 ms poll interval). The cap is enforced in `update()` with:
+Originally a single constant capped only `temp_history` at 60 entries. This was replaced by two constants with distinct purposes:
+
+```text
+PANEL_SPARK_SAMPLES = 60    — how many trailing samples the panel button sparkline shows
+HISTORY_CAP         = 900   — capacity of every per-metric VecDeque (~15 min at 1 s polling)
+```
+
+The cap is applied via the `push_capped` helper (`src/app.rs:55-59`) on each per-metric `VecDeque`:
 
 ```rust
-self.temp_history.push_back(status.liquid_temp_c);
-while self.temp_history.len() > MAX_SAMPLES {
-    self.temp_history.pop_front();
+fn push_capped(buf: &mut VecDeque<f64>, value: f64) {
+    buf.push_back(value);
+    while buf.len() > HISTORY_CAP {
+        buf.pop_front();
+    }
 }
 ```
 
-`VecDeque::pop_front` efficiently removes the oldest entry. The `while` loop (rather than `if`) is defensive against any future batch-insert path.
+`VecDeque::pop_front` efficiently removes the oldest entry. The `while` loop (rather than `if`) is defensive against any future batch-insert path. The panel sparkline receives only the trailing `PANEL_SPARK_SAMPLES` entries via `.skip(len.saturating_sub(PANEL_SPARK_SAMPLES))`.
+
+## Canvas Gradient-Filled Sparkline (src/sparkline.rs)
+
+The sparkline draws a gradient-filled area under the polyline so trends are easier to read at a glance. Three structural rules govern this:
+
+**Area path construction.** The area is a single closed polygon formed by tracing the baseline-left corner, then all polyline points in order, then the baseline-right corner, then `close()`. The `close()` call ties the bottom-right corner back to the bottom-left implicitly. For the multi-sample branch (`src/sparkline.rs:157-164`):
+
+```text
+move_to(pad,            pad + usable_h)    // baseline, left edge
+line_to(x0,             y0)               // up to first sample
+line_to(x1,             y1)
+…
+line_to(x_{n-1},        y_{n-1})          // last sample
+line_to(pad + usable_w, pad + usable_h)   // drop to baseline at right edge
+close()                                   // close back to baseline-left
+```
+
+**Gradient API.** The libcosmic-pinned `canvas::gradient::Linear` takes start/end `Point` values — NOT an angle. Top-to-bottom in screen coordinates is `start = Point::new(0.0, 0.0)` to `end = Point::new(0.0, bounds.height)` (`src/sparkline.rs:71-80`). The angle-based `Linear` in `iced_core::gradient` is for background fills and is a different type; do not confuse them. The `area_gradient` helper (`src/sparkline.rs:71`) builds the gradient: top stop alpha 0.55, bottom stop alpha 0.0.
+
+**Draw order.** `frame.fill(&area, gradient)` is called BEFORE `frame.stroke(&polyline, stroke)` (`src/sparkline.rs:177-178`) so the polyline sits on top of the gradient and remains fully visible.
+
+**Single-sample branch** (`src/sparkline.rs:120-139`): builds a closed rectangle from the tick y-coordinate down to the baseline, fills it with the gradient, then strokes the horizontal tick on top. Same fill-before-stroke order applies.
+
+## Theme-Accent Color in Canvas Programs (src/sparkline.rs:106-112)
+
+Inside `canvas::Program::draw`, the active COSMIC accent is available via:
+
+```rust
+let srgba = theme.cosmic().accent.base;
+```
+
+The type of `accent.base` is `palette::Srgba`, which is an alias for `Alpha<Rgb<Srgb, f32>, f32>`. Field access: `.red`, `.green`, `.blue` are exposed via `Deref` on the inner `Rgb`; `.alpha` is on the outer `Alpha` wrapper.
+
+There is no `From<Srgba> for iced::Color`, so the color must be constructed manually:
+
+```rust
+let accent = Color {
+    r: srgba.red,
+    g: srgba.green,
+    b: srgba.blue,
+    a: self.stroke_alpha,
+};
+```
+
+The `theme` parameter is slot 3 of `draw` (previously `_theme: &Theme` — the leading underscore was removed when the parameter became used).
+
+## Subscription Restart on Config Change (src/app.rs:269-302)
+
+`Subscription::run_with(data, fn_ptr)` takes a `fn` pointer, not a closure with captures. Iced's subscription identity is `(data, fn-ptr)`: when `data` changes, the old stream tears down and a new one starts. This is the canonical iced/cosmic idiom for re-keying a background stream when a config value changes.
+
+To pass a configurable value into the stream:
+
+1. Place the value in `data` (e.g. `interval_ms: u64`).
+2. Inside the non-capturing `fn`, dereference `data` with `*` to get an owned copy, then `move` that copy into the inner `async` block.
+
+```rust
+let interval_ms = self.config.sample_interval_ms.clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS);
+
+let liquidctl_sub = Subscription::run_with(interval_ms, |interval_ms: &u64| {
+    let interval_ms = *interval_ms;  // copy out of the reference — fn can't capture
+    cosmic::iced::stream::channel(4, move |mut channel: mpsc::Sender<Message>| async move {
+        loop {
+            // … fetch, send, sleep interval_ms …
+        }
+    })
+});
+```
+
+Because only `SampleIntervalReleased` mutates `self.config.sample_interval_ms`, the subscription identity — and therefore the running poll loop — is stable during a drag. The loop only tears down and restarts after the user releases the slider and commits a new value (`src/app.rs:269-302`).

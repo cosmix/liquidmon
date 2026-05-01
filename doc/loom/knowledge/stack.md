@@ -30,7 +30,7 @@ The core UI and application framework from System76/Pop!\_OS. Provides the `cosm
 
 ### `tokio` v1.x, features = ["process", "time"]
 
-Async runtime. Used for `tokio::process::Command` to spawn `liquidctl` as a subprocess (`liquidctl.rs:9,116`) and `tokio::time::sleep` / `tokio::time::timeout` for the 1500 ms polling interval and 3 s subprocess timeout (`app.rs:235`, `liquidctl.rs:119`). Features narrowed from `["full"]` to only the two features actually used.
+Async runtime. Used for `tokio::process::Command` to spawn `liquidctl` as a subprocess (`liquidctl.rs:9,116`) and `tokio::time::sleep` / `tokio::time::timeout` for the configurable polling interval (default 1500 ms, `app.rs:286`) and 3 s subprocess timeout (`liquidctl.rs:119`). Features narrowed from `["full"]` to only the two features actually used.
 
 ### `serde` v1.0.228, features = ["derive"]
 
@@ -48,7 +48,7 @@ Async stream utilities. Provides `SinkExt` (imported at `app.rs:14`) for `.send(
 
 ### `liquidctl` (system package)
 
-The Python CLI tool that communicates with the AIO over HID. The applet shells out to `liquidctl --match Hydro --json status` every 1500 ms (`app.rs:229`, `liquidctl.rs:116`). Must be installed via `pip` or system package manager.
+The Python CLI tool that communicates with the AIO over HID. The applet shells out to `liquidctl --match Hydro --json status` every `config.sample_interval_ms` (default 1500 ms, `app.rs:286`, `liquidctl.rs:116`). Must be installed via `pip` or system package manager.
 
 ### udev rules (`/etc/udev/rules.d/71-liquidctl.rules`)
 

@@ -7,9 +7,11 @@
 
 `src/app.rs:229` passes the literal string `"Hydro"` to `fetch_status()` on every poll tick. This is not derived from the `Config` struct and cannot be changed by the user without recompiling. The intended fix is to add a `device_filter: String` field to `Config` and thread it through the subscription. The match filter is a positional argument to `liquidctl --match`, so any device whose description does not contain `"Hydro"` will never be detected.
 
-## Hardcoded polling interval
+## Hardcoded polling interval — RESOLVED 2026-05-01
 
 `src/app.rs:235` hard-codes `Duration::from_millis(1500)` as the poll interval. `Config` has no field for this. Users on slower machines or with USB hubs that throttle HID communication cannot tune this, and a user who only wants a 10-second refresh rate (to reduce USB traffic) has no way to set it.
+
+**Resolved 2026-05-01:** Added `sample_interval_ms: u64` to `Config` (default 1500, `#[version = 2]`, hand-implemented `Default`). A slider in the popup exposes the range 1.0–10.0 s in 0.5 s steps. Drag events stage a transient `pending_interval_secs`; release commits and persists via `config.write_entry(&config_handle)`. The subscription re-keys on the clamped `interval_ms` value via `Subscription::run_with(interval_ms, fn_ptr)` — iced tears down and restarts the poll loop only when the committed value changes, keeping the running loop stable during a drag.
 
 ## `value.as_f64()` silently skips entries with non-numeric values
 
@@ -19,9 +21,9 @@
 
 `src/liquidctl.rs:219-221` explicitly returns `None` if the parsed fan index is `0`. This is a reasonable assumption for 1-based indexing, but `liquidctl` occasionally uses 0-based indexing for some controllers. Silently dropping `Fan 0` data without logging would be confusing to debug.
 
-## No app-level tests for `app.rs::update` — partially resolved 2026-04-30
+## No app-level tests for `app.rs::update` — partially resolved 2026-04-30, expanded 2026-05-01
 
-`src/app.rs` now has a `#[cfg(test)] mod tests` block covering `fan_duty_avg` and the `StatusTick(Ok)` / `StatusTick(Err)` / `PopupClosed` / `UpdateConfig` arms of `update`, plus the `MAX_SAMPLES` cap on `temp_history` (10 tests). The test module imports `cosmic::Application as _` to expose the trait method and constructs the model via `AppModel::default()`.
+`src/app.rs` now has a `#[cfg(test)] mod tests` block covering `fan_duty_avg`, `fan_speed_avg`, the `StatusTick(Ok)` / `StatusTick(Err)` / `PopupClosed` / `UpdateConfig` arms of `update`, the `HISTORY_CAP` cap on all metric histories, and the four `SampleInterval*` slider message arms (25 tests total). The test module imports `cosmic::Application as _` to expose the trait method and constructs the model via `AppModel::default()`.
 
 Still untested: `view` / `view_window` rendering, the `subscription` background task, the `TogglePopup` arm (depends on `core.main_window_id()` which requires a live Wayland surface), `fetch_status`'s subprocess invocation, `src/main.rs`, and `src/config.rs`. The first two need a headless iced/cosmic harness; subprocess testing would need a fake `liquidctl` binary on `PATH`.
 
@@ -89,7 +91,7 @@ Severity: low — maintenance burden; no immediate security risk.
 
 ## Subscription channel buffer causes non-uniform poll timing under backpressure
 
-`src/app.rs:231`: the channel created by `cosmic::iced::stream::channel(4, ...)` has a buffer of 4. The async loop at lines 234-242 sends a message then sleeps 1500 ms. If the UI event loop falls behind (compositor suspended, high CPU load), the send at line 238 will `.await` until the receiver drains a slot — blocking the sleep timer and causing the effective poll interval to expand unpredictably. A buffer of 1 would make the back-pressure visible immediately; a buffer of 4 silently absorbs up to 6 seconds of stale readings. This is unlikely to matter in practice but should be documented.
+`src/app.rs:278`: the channel created by `cosmic::iced::stream::channel(4, ...)` has a buffer of 4. The async loop sends a message then sleeps `config.sample_interval_ms`. If the UI event loop falls behind (compositor suspended, high CPU load), the send will `.await` until the receiver drains a slot — blocking the sleep timer and causing the effective poll interval to expand unpredictably. A buffer of 1 would make the back-pressure visible immediately; a buffer of 4 silently absorbs backpressure. This is unlikely to matter in practice but should be documented.
 
 Severity: informational — timing behaviour under backpressure is not documented.
 

@@ -8,37 +8,40 @@
 Read files in this order to understand the codebase end-to-end:
 
 1. `src/main.rs` (10 lines) — Entry point. Calls `cosmic::applet::run::<AppModel>(())`. Tiny file; establishes the four module names.
-2. `src/app.rs` (307 lines) — Core application logic. Defines `AppModel`, the `Message` enum, and all `cosmic::Application` trait implementations. The most important file in the codebase.
+2. `src/app.rs` (685 lines) — Core application logic. Defines `AppModel`, the `Message` enum, and all `cosmic::Application` trait implementations. The most important file in the codebase.
 3. `src/liquidctl.rs` (294 lines) — All communication with the `liquidctl` process. Defines the public `AioStatus`, `Pump`, `Fan`, and `Error` types; implements `fetch_status()` async function and the JSON parser. Contains the unit test suite.
-4. `src/sparkline.rs` (72 lines) — Iced `Canvas` widget that renders a temperature sparkline from a slice of f64 samples. Used at `src/app.rs:130`.
-5. `src/config.rs` (7 lines) — COSMIC config struct. Currently empty (`pub struct Config {}`); the place to add persistent user preferences.
+4. `src/sparkline.rs` (240 lines) — Iced `Canvas` widget that renders a gradient-filled sparkline from a slice of f64 samples. Used at `src/app.rs:207` (panel) and multiple sites in `popup_metrics_view`.
+5. `src/config.rs` (17 lines) — COSMIC config struct. Contains `sample_interval_ms: u64` (default 1500); place to add further persistent user preferences.
 
 ## Key Types and Their Locations
 
-| Type          | File               | Lines  | Purpose                                        |
-| ------------- | ------------------ | ------ | ---------------------------------------------- |
-| `AppModel`    | `src/app.rs`       | 44-58  | Top-level application state                    |
-| `Message`     | `src/app.rs`       | 61-67  | All UI/async events                            |
-| `AioStatus`   | `src/liquidctl.rs` | 12-18  | Parsed snapshot from liquidctl                 |
-| `Pump`        | `src/liquidctl.rs` | 20-24  | Pump speed + duty                              |
-| `Fan`         | `src/liquidctl.rs` | 26-31  | Per-fan speed + duty                           |
-| `Error`       | `src/liquidctl.rs` | 33-44  | liquidctl integration errors (six variants)    |
-| `Config`      | `src/config.rs`    | 5-7    | Persisted user settings (empty struct)         |
-| `Sparkline`   | `src/sparkline.rs` | 1-72   | Canvas widget for panel temperature sparkline  |
-| `DeviceEntry` | `src/liquidctl.rs` | 95-103 | Raw JSON device from liquidctl                 |
-| `StatusEntry` | `src/liquidctl.rs` | 105-111| Raw JSON status key/value/unit                 |
+| Type          | File               | Lines   | Purpose                                                  |
+| ------------- | ------------------ | ------- | -------------------------------------------------------- |
+| `AppModel`    | `src/app.rs`       | 87-115  | Top-level application state                              |
+| `Message`     | `src/app.rs`       | 117-126 | All UI/async events                                      |
+| `AioStatus`   | `src/liquidctl.rs` | 12-18   | Parsed snapshot from liquidctl                           |
+| `Pump`        | `src/liquidctl.rs` | 20-24   | Pump speed + duty                                        |
+| `Fan`         | `src/liquidctl.rs` | 26-31   | Per-fan speed + duty                                     |
+| `Error`       | `src/liquidctl.rs` | 33-44   | liquidctl integration errors (six variants)              |
+| `Config`      | `src/config.rs`    | 5-17    | Persisted user settings (`sample_interval_ms: u64`)      |
+| `Sparkline`   | `src/sparkline.rs` | 1-240   | Canvas widget for gradient-filled sparkline              |
+| `DeviceEntry` | `src/liquidctl.rs` | 95-103  | Raw JSON device from liquidctl                           |
+| `StatusEntry` | `src/liquidctl.rs` | 105-111 | Raw JSON status key/value/unit                           |
 
 ## Notable Constants and Statics
 
-| Identifier      | Location         | Value / Purpose                                               |
-| --------------- | ---------------- | ------------------------------------------------------------- |
-| `APP_ID`        | `src/app.rs:81`  | `"com.github.cosmix.LiquidMon"` — RDNN for config and desktop |
-| `AUTOSIZE_ID`   | `src/app.rs:19`  | `LazyLock<widget::Id>` — stable ID for the autosize wrapper   |
-| `MAX_SAMPLES`   | `src/app.rs:22`  | `60` — sparkline history depth (~90 s at 1500 ms/sample)      |
-| `ICON_TEMP`     | `src/app.rs:23`  | Embedded SVG bytes for temperature icon                       |
-| `ICON_SNOWFLAKE`| `src/app.rs:24`  | Embedded SVG bytes for snowflake/coolant icon                 |
-| `ICON_FAN`      | `src/app.rs:25`  | Embedded SVG bytes for fan icon                               |
-| `ICON_PUMP`     | `src/app.rs:26`  | Embedded SVG bytes for pump icon                              |
+| Identifier            | Location         | Value / Purpose                                                                  |
+| --------------------- | ---------------- | -------------------------------------------------------------------------------- |
+| `APP_ID`              | `src/app.rs:144` | `"com.github.cosmix.LiquidMon"` — RDNN for config and desktop                   |
+| `AUTOSIZE_ID`         | `src/app.rs:19`  | `LazyLock<widget::Id>` — stable ID for the autosize wrapper                     |
+| `PANEL_SPARK_SAMPLES` | `src/app.rs:21`  | `60` — trailing-N window of `temp_history` fed to the panel button sparkline     |
+| `HISTORY_CAP`         | `src/app.rs:22`  | `900` — maximum entries in each per-metric `VecDeque` (~15 min at 1 s polling)   |
+| `MIN_INTERVAL_MS`     | `src/app.rs:23`  | `1000` — lower bound (ms) for the user-configurable sample interval              |
+| `MAX_INTERVAL_MS`     | `src/app.rs:24`  | `10000` — upper bound (ms) for the user-configurable sample interval             |
+| `ICON_TEMP`           | `src/app.rs:26`  | Embedded SVG bytes for temperature icon                                          |
+| `ICON_SNOWFLAKE`      | `src/app.rs:27`  | Embedded SVG bytes for snowflake/coolant icon                                    |
+| `ICON_FAN`            | `src/app.rs:28`  | Embedded SVG bytes for fan icon                                                  |
+| `ICON_PUMP`           | `src/app.rs:29`  | Embedded SVG bytes for pump icon                                                 |
 
 ## Critical Code Paths
 
@@ -52,7 +55,7 @@ Read files in this order to understand the codebase end-to-end:
 
 ### liquidctl polling subscription
 
-`app.rs:221-246` — `subscription()`. Runs a background async stream (`Subscription::run_with`) that calls `fetch_status("Hydro")` in an infinite loop with 1500 ms sleep. Also subscribes to config changes via `core.watch_config`.
+`app.rs:265-298` — `subscription()`. Runs a background async stream (`Subscription::run_with`) that calls `fetch_status("Hydro")` in an infinite loop, sleeping `config.sample_interval_ms` (default 1500 ms) between polls. The subscription is keyed on the clamped interval value so iced tears down and restarts the poll loop only when the user commits a new interval on slider release. Also subscribes to config changes via `core.watch_config`.
 
 ### liquidctl subprocess call
 
@@ -64,7 +67,7 @@ Read files in this order to understand the codebase end-to-end:
 
 ### Message dispatch
 
-`app.rs:253-302` — `update()`. Handles `StatusTick(Ok)` by pushing temp onto `temp_history` (capped at `MAX_SAMPLES`), replacing `last_status`, and clearing `last_error`. `StatusTick(Err)` sets `last_error` but intentionally preserves stale `last_status` for display alongside the error (`app.rs:268`).
+`app.rs:295-360` — `update()`. Handles `StatusTick(Ok)` by pushing onto three metric histories (`temp_history`, `pump_duty_history`, `fan_avg_duty_history`) capped at `HISTORY_CAP` via `push_capped`, replacing `last_status`, and clearing `last_error`. The fan-average duty push is skipped when no fans are reported (pushing 0.0 would corrupt the auto-scaled y-axis). `StatusTick(Err)` sets `last_error` but intentionally preserves stale `last_status` for display alongside the error (`app.rs:332-334`). `SampleIntervalDragged` stages `pending_interval_secs` without touching config. `SampleIntervalReleased` calls `commit_pending_interval` which clamps, persists, and clears the staged value.
 
 ### Popup toggle
 
@@ -72,17 +75,17 @@ Read files in this order to understand the codebase end-to-end:
 
 ## Where to Add New Features
 
-| Feature                   | File to edit                  | Notes                                                    |
-| ------------------------- | ----------------------------- | -------------------------------------------------------- |
-| New config option         | `src/config.rs`               | Add field, increment `VERSION`                           |
-| New status metric         | `src/liquidctl.rs:166-183`    | Add match arm to the key loop; update `AioStatus` struct |
-| New popup row             | `src/app.rs:175-193`          | Add `column.add(...)` in the `Some(status)` branch       |
-| Panel button elements     | `src/app.rs:120-165`          | Modify the `row![]` in the `Some(status)` arm            |
-| New async background task | `src/app.rs:221-246`          | Add to `Subscription::batch` vector                      |
+| Feature                   | File to edit                  | Notes                                                                   |
+| ------------------------- | ----------------------------- | ----------------------------------------------------------------------- |
+| New config option         | `src/config.rs`               | Add field, increment `VERSION`, update hand-implemented `Default`        |
+| New status metric         | `src/liquidctl.rs:166-183`    | Add match arm to the key loop; update `AioStatus` struct                |
+| New popup metric section  | `src/app.rs:369`              | Add `metric_section(...)` call in `popup_metrics_view`                  |
+| Panel button elements     | `src/app.rs:190-239`          | Modify the `row![]` in the `Some(status)` arm of `view()`               |
+| New async background task | `src/app.rs:292-297`          | Add to `Subscription::batch` vector in `subscription()`                 |
 
 ## Test Coverage
 
-Tests live in two `#[cfg(test)] mod tests` blocks: one at the bottom of `src/liquidctl.rs` and one at the bottom of `src/app.rs`. 30 unit tests total. Run with `cargo test`.
+Tests live in two `#[cfg(test)] mod tests` blocks: one at the bottom of `src/liquidctl.rs` and one at the bottom of `src/app.rs`. 45 unit tests total. Run with `cargo test`.
 
 ### `src/liquidctl.rs` — parser tests (20)
 
@@ -102,14 +105,22 @@ Fixture and error-path coverage:
 - `display_includes_field_name_for_missing_field`, `display_for_no_device_and_timeout` — `Display` impl smoke tests
 - `error_source_chains_for_inner_io_and_parse` — `std::error::Error::source()` chains for `Spawn`/`Parse`, returns `None` for `NoDevice`/`MissingField`/`Timeout`
 
-### `src/app.rs` — model tests (10)
+### `src/app.rs` — model tests (25)
 
-Helper and `update()` state-transition tests. The test module imports `cosmic::Application as _` to bring the trait method `update` into scope, and constructs `AppModel` via `AppModel::default()` (which works because `cosmic::Core: Default` and all other fields derive `Default`):
+Helper and `update()` state-transition tests. The test module imports `cosmic::Application as _` to bring the trait method `update` into scope, and constructs `AppModel` via `AppModel::default()`:
 
-- `fan_duty_avg_is_none_for_empty`, `fan_duty_avg_computes_integer_mean`, `fan_duty_avg_truncates_toward_zero`, `fan_duty_avg_at_max` — pure helper at `app.rs:34-40`
+- `fan_duty_avg_is_none_for_empty`, `fan_duty_avg_computes_integer_mean`, `fan_duty_avg_truncates_toward_zero`, `fan_duty_avg_at_max` — `fan_duty_avg` helper
+- `fan_speed_avg_computes_integer_mean` — `fan_speed_avg` helper (new); also tests the `None` case for empty fans
 - `status_tick_ok_appends_temp_and_clears_error` — `StatusTick(Ok)` pushes to `temp_history`, sets `last_status`, clears `last_error`
-- `status_tick_err_preserves_stale_status` — `StatusTick(Err)` sets `last_error` but does NOT clear `last_status` (the deliberate stale-data design at `app.rs:274`)
-- `temp_history_caps_at_max_samples` — pushing `MAX_SAMPLES + 10` samples leaves exactly `MAX_SAMPLES = 60`, with the oldest dropped from the front
+- `status_tick_err_preserves_stale_status` — `StatusTick(Err)` sets `last_error` but does NOT clear `last_status`
+- `temp_history_caps_at_history_cap` — pushing `HISTORY_CAP + 10` samples leaves exactly `HISTORY_CAP = 900`, oldest entries dropped
+- `status_tick_ok_appends_to_all_metric_histories` — temp / pump-duty / fan-avg-duty histories all grow on a tick with fans; fan-average duty is computed correctly
+- `status_tick_with_no_fans_skips_fan_history_push` — fan histories remain empty when `status.fans` is empty
+- `sample_interval_dragged_stages_pending_value` — `SampleIntervalDragged` stores transient value without changing `config.sample_interval_ms`
+- `sample_interval_released_commits_clamped_value` — `SampleIntervalReleased` commits and clears pending value
+- `sample_interval_released_clamps_above_max` — values above `MAX_INTERVAL_MS` are clamped
+- `sample_interval_released_clamps_below_min` — values below `MIN_INTERVAL_MS` are clamped
+- `sample_interval_released_without_drag_is_noop` — no-op when `pending_interval_secs` is `None`
 - `popup_closed_with_matching_id_clears_popup`, `popup_closed_with_non_matching_id_is_noop` — `PopupClosed(Id)` only clears when the id matches
 - `update_config_replaces_config` — `UpdateConfig(Config)` arm runs without disturbing other state
 
