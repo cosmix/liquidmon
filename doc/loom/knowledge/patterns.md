@@ -192,19 +192,35 @@ Phase 1: deserialize to `Vec<DeviceEntry>` (private structs). Phase 2: iterate `
 
 ## Sparkline Canvas Widget (src/sparkline.rs)
 
-`Sparkline` is a struct holding `samples: Vec<f64>` constructed from any `IntoIterator<Item = f64>` (sparkline.rs:9-18). It implements `canvas::Program<Message, Theme>` with `type State = ()` — no mutable canvas state (sparkline.rs:21-22).
+`Sparkline` is a struct holding `samples: Vec<f64>` constructed from any `IntoIterator<Item = f64>` (sparkline.rs:18-27). It implements `canvas::Program<Message, Theme>` with `type State = ()` — no mutable canvas state (sparkline.rs:60-61).
 
-The `draw` method (sparkline.rs:24-71):
+The `draw` method (sparkline.rs:63-119):
 
-- Returns early with an empty frame if fewer than 2 samples are available (sparkline.rs:34-36).
-- Uses a **fixed y-axis domain** of 10–40 °C (const Y_MIN/Y_MAX), intentionally not auto-scaled to the sample range. Values outside this band visually pin at the top or bottom edge — a deliberate design choice documented with a comment (sparkline.rs:38-42).
-- Computes a 1 px `pad` on each edge; `usable_w` and `usable_h` clamp to at least 1.0 via `.max(1.0)` (sparkline.rs:46-48).
-- Maps sample index `i` to x: `pad + (i / (n-1)) * usable_w`; maps sample value to y: `pad + (1 - norm) * usable_h`, where `norm = (sample - Y_MIN) / range` and y is inverted so higher values render higher in the frame (sparkline.rs:51-61).
-- Builds a `Path` via `Path::new(|p| { ... })` using `p.move_to` for the first point and `p.line_to` for subsequent points (sparkline.rs:50-62).
-- Strokes the path with `Color::from_rgba8(180, 200, 230, 0.85)` (light blue, slightly transparent) at width 1.5 (sparkline.rs:64-68).
+- Returns early with an empty frame when `samples.is_empty()` (sparkline.rs:74-76).
+- Computes the y-axis range via the pure helper `y_range(&self.samples)` (sparkline.rs:35-58), which auto-scales to the sample min/max but enforces a `MIN_Y_SPAN = 2.0` °C floor centered on the data midpoint (see "Sparkline y_range Helper" below).
+- Computes a 1 px `pad` on each edge; `usable_w` and `usable_h` clamp to at least 1.0 via `.max(1.0)` (sparkline.rs:78-80).
+- **Single-sample branch** (sparkline.rs:90-100): renders a horizontal tick at the sample's y across the full canvas width, so the sparkline is visible after the first poll instead of waiting for a second sample.
+- **Multi-sample branch** (sparkline.rs:102-117): maps sample index `i` to x: `pad + (i / (n-1)) * usable_w`; maps value to y: `pad + (1 - norm) * usable_h`, where `norm = (sample - y_min) / range` and y is inverted so higher values render higher in the frame.
+- Builds a `Path` via `Path::new(|p| { ... })` using `p.move_to` for the first point and `p.line_to` for subsequent points.
+- Strokes the path with `Color::from_rgba8(180, 200, 230, 0.85)` (light blue, slightly transparent) at width 1.5.
 - Returns `vec\![frame.into_geometry()]` — single geometry element per draw call.
 
-The widget is embedded in `view()` as `Canvas::new(Sparkline::new(...))` with explicit `.width(Length::Fixed(36.0)).height(Length::Fixed(16.0))` (app.rs:130-132).
+The widget is embedded in `view()` as `Canvas::new(Sparkline::new(...))` with explicit `.width(Length::Fixed(36.0)).height(Length::Fixed(16.0))` (app.rs:129-131).
+
+## Sparkline y_range Helper (src/sparkline.rs:35-58)
+
+`fn y_range(samples: &[f64]) -> (f64, f64)` is a pure module-private helper that decouples the y-axis computation from the canvas draw call. This makes the scaling logic unit-testable without instantiating an iced renderer or canvas frame.
+
+Algorithm:
+
+1. Empty samples → return `(-1.0, 1.0)` (a `MIN_Y_SPAN`-wide band around 0). `draw` never invokes the helper for empty input, but the safe return prevents accidental division-by-zero if a future caller does.
+2. Compute `min` and `max` across samples via a single forward pass (no allocations, no sort).
+3. If `max - min < MIN_Y_SPAN`, expand symmetrically around the midpoint: `mid = (min + max) / 2`, return `(mid - MIN_Y_SPAN/2, mid + MIN_Y_SPAN/2)`.
+4. Otherwise return `(min, max)` unchanged.
+
+The `MIN_Y_SPAN = 2.0` °C floor is the load-bearing design decision: it suppresses sub-degree sensor noise (which would otherwise look like wild oscillations on a 2 °C-tall canvas) while letting any real spike of ≥ 2 °C fill the canvas vertically. The const is module-private; tests (sparkline.rs:122+) reference it via `use super::*`.
+
+This pattern — extract a pure helper from a draw/render method specifically so the math can be tested in isolation — is the precedent for any future canvas widgets in the project.
 
 ## LazyLock for Stable Widget IDs (src/app.rs:19-20)
 

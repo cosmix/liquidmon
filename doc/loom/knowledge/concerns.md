@@ -55,11 +55,13 @@ The metainfo/AppStream file does not list a `requires` or `recommends` element f
 
 Severity: medium — may cause complete parse failure when a future liquidctl version adds string-typed status fields.
 
-## Sparkline Y-axis hardcoded to 10–40°C
+## Sparkline Y-axis hardcoded to 10–40°C — RESOLVED 2026-05-01
 
-`src/sparkline.rs:41-42` sets `Y_MIN = 10.0` and `Y_MAX = 40.0`. Values outside this range silently clamp to the top or bottom edge. High-load scenarios or poorly cooled systems can push liquid temps above 40°C; the sparkline would show a flat top line with no visual distinction between 40°C and 55°C, masking a thermal alert. The range should either be dynamic (min/max of the sample window) or configurable, and the user should receive some out-of-range indication.
+Originally `src/sparkline.rs:41-42` set `Y_MIN = 10.0` and `Y_MAX = 40.0`. Values outside this range silently mapped to off-canvas coordinates (the polyline disappeared entirely below 10 °C or above 40 °C — they did not "clamp to the edge" in the visual sense; they vanished). Additionally, the `samples.len() < 2` early-return left the sparkline blank for the first ~1.5 s after the first poll.
 
-Severity: low-medium — cosmetic but misleading under thermal stress.
+**Resolved** by replacing the static range with the pure helper `y_range(&[f64])` (`src/sparkline.rs:35`) which auto-scales from the sample window with a `MIN_Y_SPAN = 2.0` °C floor (centered on the data midpoint) so noise isn't amplified into apparent chaos. The `< 2` early-return was replaced with a single-sample horizontal-tick branch (`src/sparkline.rs:90-100`) so the sparkline is visible immediately after the first reading. Six unit tests cover the y_range helper.
+
+Severity: was low-medium — now resolved.
 
 ## `fan_duty_avg` truncates integer division
 

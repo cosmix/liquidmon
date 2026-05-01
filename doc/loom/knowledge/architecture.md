@@ -304,9 +304,21 @@ No `.cargo/config.toml` is checked into the repo. It is generated transiently by
 
 The release workflow uses `cargo install cargo-deb` then `cargo deb --no-build` (since the binary is already stripped) to produce the `.deb` artifact.
 
-## Sparkline Fixed Temperature Scale (src/sparkline.rs:41-42)
+## Sparkline Fixed Temperature Scale (src/sparkline.rs:41-42) — SUPERSEDED
 
-The sparkline Y-axis is hardcoded to `[10.0, 40.0]` °C — it does NOT auto-scale to data. Any reading above 40 °C pins at the top edge without visual distinction. This is a soft limit; real AIO liquid temps rarely exceed 40 °C under normal load, but the limitation is invisible to the user and creates false-flat sparklines during thermal events.
+The sparkline Y-axis was hardcoded to `[10.0, 40.0]` °C and did NOT auto-scale. Any reading outside this band silently mapped to off-canvas coordinates and disappeared. **This entry is historical** — see "Sparkline Auto-Scaled Y-Axis" below for current behavior.
+
+## Sparkline Auto-Scaled Y-Axis (src/sparkline.rs)
+
+The sparkline Y-axis is now computed from the visible sample window via the pure helper `y_range(&[f64]) -> (f64, f64)` (`src/sparkline.rs:35`). Auto-scaling means real spikes and trends fill the canvas vertically; out-of-range readings can no longer disappear off-edge.
+
+A floor `MIN_Y_SPAN: f64 = 2.0` (`src/sparkline.rs:16`) is enforced when the natural sample range is narrower than 2 °C — the band is centered on the data midpoint so flat traces and sub-degree sensor noise render around the canvas midline rather than as amplified false spikes.
+
+Edge-case behavior:
+
+- Empty samples: `y_range` returns `(-1.0, 1.0)` so the caller can compute a midpoint without dividing by zero (no path is drawn for empty input — `draw` early-returns at the `is_empty()` check).
+- Single sample: `draw` (`src/sparkline.rs:90-100`) renders a horizontal tick at the sample's y across the full canvas width, so the sparkline is visible immediately after the first poll instead of waiting for a second reading.
+- Two or more samples: standard polyline.
 
 ## Icon Situation: Stub vs. Symbolic Set
 
