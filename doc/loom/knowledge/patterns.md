@@ -387,3 +387,111 @@ let liquidctl_sub = Subscription::run_with(interval_ms, |interval_ms: &u64| {
 ```
 
 Because only `SampleIntervalReleased` mutates `self.config.sample_interval_ms`, the subscription identity — and therefore the running poll loop — is stable during a drag. The loop only tears down and restarts after the user releases the slider and commits a new value (`src/app.rs:269-302`).
+
+## Subscription Composite Key (`(interval_ms, match_str)`) and Optional Poll (src/app.rs)
+
+`Subscription::run_with` requires only `D: Hash + 'static`, not `Send + Sync + Clone`. A tuple of `(u64, String)` qualifies, so the device-selector subscription threads the match string through alongside the interval:
+
+```rust
+let key: (u64, String) = (interval_ms, match_str);
+Subscription::run_with(key, |key: &(u64, String)| {
+    let interval_ms = key.0;
+    let match_str = key.1.clone();
+    cosmic::iced::stream::channel(4, move |mut channel| async move {
+        loop { /* fetch_status(&match_str) … sleep interval_ms */ }
+    })
+})
+```
+
+The fn pointer is non-capturing (the data tuple rides through), and the inner `async move` clones the string out of the borrow on each subscription start. Either dimension changing — committed interval OR selected device — re-keys the subscription identity and restarts the loop.
+
+**Optional poll subscription pattern.** `subscription()` builds a `Vec<Subscription<Message>>` and only appends the poll when `effective_match()` is `Some`. Until the first `DevicesEnumerated` Task lands, no poll runs at all — this prevents the panel from flashing a spurious "no AIO device" error during the brief startup window before enumeration completes. The config-watch sub is always installed and is the only sub before enumeration finishes.
+
+## AIO Auto-Detection via Substring Catalog (src/devices.rs)
+
+Device classification is split between three layers so the policy can evolve without touching the parser or the UI:
+
+1. **`AIO_PATTERNS: &[&str]`** (`src/devices.rs`) — module-private array of lowercase substrings. Each entry is intentionally narrow (e.g. `"hydro"`, `"icue h"`) and corresponds to a liquidctl driver family verified against the current `parse_status_response` schema.
+2. **`is_aio(description)`** — single `to_ascii_lowercase` on the description, then `AIO_PATTERNS.iter().any(|p| d.contains(p))`. Patterns are pre-lowercased so the per-call hot path allocates the description once and does no allocation per pattern.
+3. **`filter_aios` / `auto_select`** — pure functions returning borrowed slices/refs from the caller-owned `&[DetectedDevice]`. No ownership transfer, no clones.
+
+The actual `--match` value sent to liquidctl is the device's full `description` (verbatim), not a pattern. Patterns classify; descriptions select. liquidctl performs case-insensitive substring matching on the description, so a unique device of any given family is uniquely selected. With two identical AIOs connected, this is ambiguous (liquidctl picks the first); disambiguation via `--bus`/`--address` is deferred — `DetectedDevice` already carries `bus` and `address` for the eventual follow-up.
+
+Adding a new family means adding one lowercase pattern AND verifying the parser handles that driver's status schema (key names, `Coolant temperature` vs `Liquid temperature`, indexed vs non-indexed `Fan N`). The current catalog is restricted to `hydro_platinum.py`-derived devices; `Compatibility Constraints` in `doc/plans/PLAN-device-selector.md` enumerates deferred families.
+
+## Subprocess Serialization via tokio::sync::Mutex (src/liquidctl.rs)
+
+Every `liquidctl` subprocess call (`fetch_status`, `list_devices`) acquires a module-private async mutex at the top of the function:
+
+```rust
+static LIQUIDCTL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
+    let _guard = LIQUIDCTL_LOCK.lock().await;
+    // … existing body …
+}
+```
+
+The motivation is the exclusive `O_RDWR` claim that `liquidctl` opens on `/dev/hidrawN` per device via HIDAPI. If a popup-open enumerate fires while a status poll is mid-flight on the same device, the second invocation can fail with a permission/busy error, surfacing as a spurious `last_error`. Holding the mutex guarantees only one liquidctl subprocess runs at a time. The lock is held only for the subprocess duration (≤3 s for status, ≤1 s for list); contention is bounded to one poll-cycle in the worst case.
+
+This is `tokio::sync::Mutex` (held across `.await`), NOT `std::sync::Mutex`. The static initializer is `LazyLock::new(|| Mutex::new(()))` — `tokio::sync::Mutex::new` is not `const`-constructible.
+
+## Tolerant Field Deserialization with serde_json::Value (src/liquidctl.rs)
+
+`liquidctl list --json` typically emits `bus` and `address` as strings, but defensive deserialization through `serde_json::Value` protects against future driver changes that might emit numbers (e.g. numeric USB addresses on some backends):
+
+```rust
+fn deserialize_string_lossy<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
+}
+
+#[derive(Deserialize)]
+struct ListDeviceEntry {
+    description: String,
+    #[serde(deserialize_with = "deserialize_string_lossy")]
+    bus: String,
+    #[serde(deserialize_with = "deserialize_string_lossy")]
+    address: String,
+}
+```
+
+This is the precedent for any future field whose JSON type is not strictly contractual. Note that `description` is NOT made tolerant — it is structurally required to be a string and a non-string description is a real error worth surfacing. Use the lossy treatment only on truly metadata-shaped fields where empty-on-mismatch is preferable to parse failure.
+
+## Effective-Value Resolution Helper (src/app.rs::effective_match)
+
+When configuration carries `Option<T>` semantics (None = "auto"), encapsulate the auto-vs-explicit resolution behind a single private method:
+
+```rust
+fn effective_match(&self) -> Option<String> {
+    self.config.device_match.clone()
+        .or_else(|| devices::auto_select(&self.detected_devices)
+            .map(|d| d.description.clone()))
+}
+```
+
+Every call site (subscription key, dropdown selection, history-reset diff) uses this exact method instead of inlining the auto-select logic. The benefits:
+
+- The "did the effective device change?" diff in `DevicesEnumerated`/`DeviceSelected` is just `prev != new` against snapshots taken before/after the mutation.
+- A semantic no-op (e.g. user explicitly picks the device that auto-detect would have picked anyway) skips the history reset, because `effective_match()` returned the same value before and after.
+- Adding a future "effective sample rate" or similar Option-config-with-fallback follows the same pattern.
+
+## reset_device_state Coalescing Helper (src/app.rs)
+
+When a model-state mutation invalidates multiple correlated buffers, extract the clearing into one private helper rather than duplicating it at each call site:
+
+```rust
+fn reset_device_state(&mut self) {
+    self.temp_history.clear();
+    self.pump_duty_history.clear();
+    self.fan_avg_duty_history.clear();
+    self.last_status = None;
+    self.last_error = None;
+}
+```
+
+Both `DevicesEnumerated` (auto-pick changed) and `DeviceSelected` (explicit pick changed) invoke this. New per-device state added in the future (e.g. another sparkline history) is reset by editing one place. The helper is `&mut self`-only and does not return a `Task`, so it composes cleanly inside an `update` arm that may also need to return a Task downstream.

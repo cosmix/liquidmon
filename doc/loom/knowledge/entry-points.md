@@ -7,26 +7,29 @@
 
 Read files in this order to understand the codebase end-to-end:
 
-1. `src/main.rs` (10 lines) — Entry point. Calls `cosmic::applet::run::<AppModel>(())`. Tiny file; establishes the four module names.
-2. `src/app.rs` (685 lines) — Core application logic. Defines `AppModel`, the `Message` enum, and all `cosmic::Application` trait implementations. The most important file in the codebase.
-3. `src/liquidctl.rs` (294 lines) — All communication with the `liquidctl` process. Defines the public `AioStatus`, `Pump`, `Fan`, and `Error` types; implements `fetch_status()` async function and the JSON parser. Contains the unit test suite.
-4. `src/sparkline.rs` (240 lines) — Iced `Canvas` widget that renders a gradient-filled sparkline from a slice of f64 samples. Used at `src/app.rs:207` (panel) and multiple sites in `popup_metrics_view`.
-5. `src/config.rs` (17 lines) — COSMIC config struct. Contains `sample_interval_ms: u64` (default 1500); place to add further persistent user preferences.
+1. `src/main.rs` (11 lines) — Entry point. Calls `cosmic::applet::run::<AppModel>(())`. Tiny file; establishes the five module names (`app`, `config`, `devices`, `liquidctl`, `sparkline`).
+2. `src/app.rs` (~1148 lines) — Core application logic. Defines `AppModel`, the `Message` enum, and all `cosmic::Application` trait implementations. The most important file in the codebase.
+3. `src/liquidctl.rs` (~629 lines) — All communication with the `liquidctl` process. Defines the public `AioStatus`, `Pump`, `Fan`, `DetectedDevice`, and `Error` types; implements `fetch_status()` and `list_devices()` async functions and the JSON parsers. All subprocess calls serialize behind a module-private `LIQUIDCTL_LOCK` mutex.
+4. `src/devices.rs` (~100 lines) — AIO classification helpers. Contains the `AIO_PATTERNS` substring catalog (lowercase, narrow to families verified against the parser schema), plus pure helpers `is_aio`, `filter_aios`, and `auto_select`.
+5. `src/sparkline.rs` (240 lines) — Iced `Canvas` widget that renders a gradient-filled sparkline from a slice of f64 samples. Used in `view()` (panel) and multiple sites in `popup_metrics_view`.
+6. `src/config.rs` (~21 lines) — COSMIC config struct, `#[version = 3]`. Contains `sample_interval_ms: u64` (default 1500) and `device_match: Option<String>` (default `None` = auto-detect).
 
 ## Key Types and Their Locations
 
-| Type          | File               | Lines   | Purpose                                                  |
-| ------------- | ------------------ | ------- | -------------------------------------------------------- |
-| `AppModel`    | `src/app.rs`       | 87-115  | Top-level application state                              |
-| `Message`     | `src/app.rs`       | 117-126 | All UI/async events                                      |
-| `AioStatus`   | `src/liquidctl.rs` | 12-18   | Parsed snapshot from liquidctl                           |
-| `Pump`        | `src/liquidctl.rs` | 20-24   | Pump speed + duty                                        |
-| `Fan`         | `src/liquidctl.rs` | 26-31   | Per-fan speed + duty                                     |
-| `Error`       | `src/liquidctl.rs` | 33-44   | liquidctl integration errors (six variants)              |
-| `Config`      | `src/config.rs`    | 5-17    | Persisted user settings (`sample_interval_ms: u64`)      |
-| `Sparkline`   | `src/sparkline.rs` | 1-240   | Canvas widget for gradient-filled sparkline              |
-| `DeviceEntry` | `src/liquidctl.rs` | 95-103  | Raw JSON device from liquidctl                           |
-| `StatusEntry` | `src/liquidctl.rs` | 105-111 | Raw JSON status key/value/unit                           |
+| Type              | File               | Purpose                                                                                  |
+| ----------------- | ------------------ | ---------------------------------------------------------------------------------------- |
+| `AppModel`        | `src/app.rs`       | Top-level application state (12 fields incl. `detected_devices`, `device_scan_in_flight`) |
+| `Message`         | `src/app.rs`       | All UI/async events (8 variants incl. `DevicesEnumerated`, `DeviceSelected`)              |
+| `AioStatus`       | `src/liquidctl.rs` | Parsed snapshot from `liquidctl --json status`                                            |
+| `Pump`            | `src/liquidctl.rs` | Pump speed + duty                                                                         |
+| `Fan`             | `src/liquidctl.rs` | Per-fan speed + duty                                                                      |
+| `DetectedDevice`  | `src/liquidctl.rs` | Public type emitted by `list_devices` — `description`, `bus`, `address`                    |
+| `Error`           | `src/liquidctl.rs` | liquidctl integration errors (six variants — shared by `fetch_status` and `list_devices`) |
+| `Config`          | `src/config.rs`    | Persisted user settings (`sample_interval_ms: u64`, `device_match: Option<String>`) — v3   |
+| `Sparkline`       | `src/sparkline.rs` | Canvas widget for gradient-filled sparkline                                              |
+| `DeviceEntry`     | `src/liquidctl.rs` | Private — raw `--json status` device                                                     |
+| `StatusEntry`     | `src/liquidctl.rs` | Private — raw status key/value/unit                                                       |
+| `ListDeviceEntry` | `src/liquidctl.rs` | Private — raw `list --json` entry; tolerant string deserialization for `bus`/`address`     |
 
 ## Notable Constants and Statics
 
@@ -55,11 +58,15 @@ Read files in this order to understand the codebase end-to-end:
 
 ### liquidctl polling subscription
 
-`app.rs:265-298` — `subscription()`. Runs a background async stream (`Subscription::run_with`) that calls `fetch_status("Hydro")` in an infinite loop, sleeping `config.sample_interval_ms` (default 1500 ms) between polls. The subscription is keyed on the clamped interval value so iced tears down and restarts the poll loop only when the user commits a new interval on slider release. Also subscribes to config changes via `core.watch_config`.
+`subscription()` builds the config-watch subscription unconditionally and appends the poll subscription only when `effective_match()` is `Some(_)`. The poll is keyed on `(u64, String) = (interval_ms, match_str)`, so changing either the user-committed interval or the selected device tears down and restarts the poll loop. Until the first `DevicesEnumerated` lands, no poll subscription exists — the panel shows `…` instead of a spurious "no AIO" error.
 
-### liquidctl subprocess call
+### liquidctl subprocess calls
 
-`liquidctl.rs:115-138` — `fetch_status()`. Sets `kill_on_drop(true)`, wraps `cmd.output()` in `tokio::time::timeout(Duration::from_secs(3))`, checks exit code, returns UTF-8 stdout to the parser. Match filter is `"Hydro"` (hardcoded at `app.rs:229`).
+`fetch_status()` sets `kill_on_drop(true)`, wraps `cmd.output()` in `tokio::time::timeout(Duration::from_secs(3))`, and returns UTF-8 stdout to `parse_status_response`. The match filter is the description string from `effective_match()`.
+
+`list_devices()` is the parallel enumeration entry point: spawns `liquidctl list --json` with a 1 s timeout (HID enumeration only — no per-device transaction), parses into `Vec<DetectedDevice>` via `parse_devices_response`. An empty array deserializes to `Ok(vec![])`, distinct from `fetch_status`'s `Error::NoDevice`.
+
+Both functions acquire `LIQUIDCTL_LOCK: LazyLock<tokio::sync::Mutex<()>>` at the top of their body. The lock prevents concurrent subprocess invocations from racing on the exclusive HID claim (e.g. popup-open enumerate vs. in-flight poll).
 
 ### JSON parsing
 
@@ -67,7 +74,11 @@ Read files in this order to understand the codebase end-to-end:
 
 ### Message dispatch
 
-`app.rs:295-360` — `update()`. Handles `StatusTick(Ok)` by pushing onto three metric histories (`temp_history`, `pump_duty_history`, `fan_avg_duty_history`) capped at `HISTORY_CAP` via `push_capped`, replacing `last_status`, and clearing `last_error`. The fan-average duty push is skipped when no fans are reported (pushing 0.0 would corrupt the auto-scaled y-axis). `StatusTick(Err)` sets `last_error` but intentionally preserves stale `last_status` for display alongside the error (`app.rs:332-334`). `SampleIntervalDragged` stages `pending_interval_secs` without touching config. `SampleIntervalReleased` calls `commit_pending_interval` which clamps, persists, and clears the staged value.
+`update()` handles `StatusTick(Ok)` by pushing onto three metric histories (`temp_history`, `pump_duty_history`, `fan_avg_duty_history`) capped at `HISTORY_CAP` via `push_capped`, replacing `last_status`, and clearing `last_error`. The fan-average duty push is skipped when no fans are reported (pushing 0.0 would corrupt the auto-scaled y-axis). `StatusTick(Err)` sets `last_error` but intentionally preserves stale `last_status` for display alongside the error. `SampleIntervalDragged` stages `pending_interval_secs` without touching config. `SampleIntervalReleased` calls `commit_pending_interval` which clamps, persists, and clears the staged value.
+
+`DevicesEnumerated(Ok(devs))` snapshots `effective_match` before and after replacing `detected_devices`; if the effective device changed, it calls `reset_device_state()` which clears all three histories plus `last_status`/`last_error`. If no AIO is detected, sets `last_error` to a guidance string. `DevicesEnumerated(Err(msg))` writes `last_error` and clears `device_scan_in_flight` without touching status state. `DeviceSelected(choice)` short-circuits when `config.device_match == choice`; otherwise mirrors the same prev/new effective-match diff and persists via `config.write_entry(handle)` — semantic no-ops (e.g. explicit pick of the auto device) do not reset history.
+
+The `TogglePopup` open branch now batches `get_popup` with a fresh `list_devices` Task (gated on `!device_scan_in_flight`) so opening the popup re-enumerates hot-plugged devices.
 
 ### Popup toggle
 
@@ -77,11 +88,12 @@ Read files in this order to understand the codebase end-to-end:
 
 | Feature                   | File to edit                  | Notes                                                                   |
 | ------------------------- | ----------------------------- | ----------------------------------------------------------------------- |
-| New config option         | `src/config.rs`               | Add field, increment `VERSION`, update hand-implemented `Default`        |
-| New status metric         | `src/liquidctl.rs:166-183`    | Add match arm to the key loop; update `AioStatus` struct                |
-| New popup metric section  | `src/app.rs:369`              | Add `metric_section(...)` call in `popup_metrics_view`                  |
-| Panel button elements     | `src/app.rs:190-239`          | Modify the `row![]` in the `Some(status)` arm of `view()`               |
-| New async background task | `src/app.rs:292-297`          | Add to `Subscription::batch` vector in `subscription()`                 |
+| New config option         | `src/config.rs`               | Add field, increment `#[version = N]`, update hand-implemented `Default`            |
+| New status metric         | `src/liquidctl.rs`            | Add match arm to the key loop in `parse_status_response`; update `AioStatus`        |
+| New popup metric section  | `src/app.rs:popup_metrics_view` | Add `metric_section(...)` call between heading and slider                        |
+| Panel button elements     | `src/app.rs:view`             | Modify the `row![]` in the `Some(status)` arm                                       |
+| New async background task | `src/app.rs:subscription`     | Append to the `subs` Vec; key on whatever data should restart the stream            |
+| New AIO family pattern    | `src/devices.rs:AIO_PATTERNS` | Add a lowercase substring; pair with parser-schema verification                    |
 
 ## Test Coverage
 

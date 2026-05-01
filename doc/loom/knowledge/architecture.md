@@ -27,15 +27,17 @@ src/
 ```text
 main.rs
   ├── mod config    (config.rs)
+  ├── mod devices   (devices.rs)
   ├── mod liquidctl (liquidctl.rs)
   ├── mod sparkline (sparkline.rs)
   └── mod app       (app.rs)
         ├── uses crate::config::Config
-        ├── uses crate::liquidctl::AioStatus
+        ├── uses crate::liquidctl::{AioStatus, DetectedDevice, list_devices, fetch_status}
+        ├── uses crate::devices::{filter_aios, auto_select}
         └── uses crate::sparkline::Sparkline
 ```
 
-`main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the only consumer of `config`, `liquidctl`, and `sparkline`.
+`main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the only consumer of `config`, `liquidctl`, `devices`, and `sparkline`. The `devices` module depends only on `liquidctl::DetectedDevice`.
 
 ## COSMIC Applet Framework Integration
 
@@ -58,7 +60,7 @@ Panel button is rendered by `view()` (src/app.rs:120-165); popup overlay by `vie
 AppModel {
     core:                  cosmic::Core           // COSMIC runtime handle
     popup:                 Option<Id>             // Some(id) when popup is open
-    config:                Config                 // Persisted config (cosmic_config)
+    config:                Config                 // Persisted config (cosmic_config) — v3
     config_handle:         Option<cosmic_config::Config>  // kept alive for write_entry
     pending_interval_secs: Option<f32>            // slider drag value (None outside drag)
     last_status:           Option<AioStatus>      // Most-recent successful liquidctl read
@@ -66,6 +68,8 @@ AppModel {
     temp_history:          VecDeque<f64>          // Liquid temp samples (cap: HISTORY_CAP=900)
     pump_duty_history:     VecDeque<f64>          // Pump duty % samples (popup sparkline)
     fan_avg_duty_history:  VecDeque<f64>          // Mean fan duty % (popup sparkline)
+    detected_devices:      Vec<DetectedDevice>    // Latest liquidctl list enumeration
+    device_scan_in_flight: bool                   // True while a list_devices Task is in flight
 }
 ```
 
@@ -130,7 +134,39 @@ Subscription::run_with(interval_ms, …)    [src/app.rs:276]
                  └─ framework re-renders view() / view_window()
 ```
 
-Match filter is hardcoded to `"Hydro"` at `src/app.rs:229`. Device selection picks the first `DeviceEntry` with a non-empty `status` array (`src/liquidctl.rs:145-148`).
+Match filter is the description string returned by `AppModel::effective_match()` (config override or auto-pick). Device selection during status parsing still picks the first `DeviceEntry` with a non-empty `status` array (`src/liquidctl.rs`); liquidctl's `--match` performs case-insensitive substring matching against the device description.
+
+## Data Flow: Device Enumeration → Selection
+
+Independent of the status poll loop:
+
+```text
+init                               [src/app.rs:163]
+  └─ Task::perform(list_devices)
+       └─ liquidctl::list_devices()              [src/liquidctl.rs:240]
+            └─ tokio::process::Command::new("liquidctl")
+                 .args(["list", "--json"])  ── 1 s timeout
+            └─ parse_devices_response(raw)        [src/liquidctl.rs:270]
+                 └─ Vec<ListDeviceEntry>          [src/liquidctl.rs:286]
+                      └─ map → Vec<DetectedDevice>
+       └─ Message::DevicesEnumerated(Ok(devs))
+            └─ AppModel.detected_devices = devs
+            └─ if effective_match() changed → reset_device_state()
+            └─ if effective_match() == None → last_error = "no supported AIO detected …"
+
+TogglePopup (open branch)          [src/app.rs:382]
+  └─ if !device_scan_in_flight: Task::batch([get_popup, list_devices])
+       (re-enumerates so hot-plugged devices appear in the dropdown)
+
+DeviceSelected(Option<String>)     [src/app.rs:425]
+  └─ config.device_match = choice
+  └─ if effective_match() changed → reset_device_state()
+  └─ persist via config.write_entry(handle)
+```
+
+`devices::is_aio` consults a substring catalog `AIO_PATTERNS` (`src/devices.rs`) of lowercase patterns covering `hydro_platinum.py`-compatible families (Corsair Hydro Pro/Pro XT/Platinum and iCUE Elite Capellix/RGB in v1). `filter_aios` and `auto_select` are pure functions returning borrowed slices/refs.
+
+All `liquidctl` subprocess calls (`fetch_status`, `list_devices`) acquire a module-private `LIQUIDCTL_LOCK: LazyLock<tokio::sync::Mutex<()>>` (`src/liquidctl.rs:15`) so concurrent invocations cannot race on the exclusive HID claim. Lock is held only for the subprocess duration (≤3 s for status, ≤1 s for list).
 
 ## Liquidctl JSON Parsing (src/liquidctl.rs)
 
@@ -202,13 +238,12 @@ Installed paths use RDNN `com.github.cosmix.LiquidMon`. Vendored dependency work
 
 ## Cross-Cutting Concerns Synthesis
 
-### The "Partially Hardcoded Config" Gap
+### The "Partially Hardcoded Config" Gap — RESOLVED 2026-05-01
 
-The configuration infrastructure is fully wired. One runtime behavior remains hardcoded outside the config system:
+Both runtime behaviors that were previously hardcoded are now config-driven:
 
-- Device match filter: `"Hydro"` at `src/app.rs:280` — not derived from `Config`; cannot be changed without recompiling.
-
-The poll interval is no longer hardcoded: it is stored in `Config.sample_interval_ms` (default 1500 ms), user-settable via the slider in the popup, and persisted via `config.write_entry`. The subscription re-keys on the clamped interval so the poll loop restarts only on slider release (`src/app.rs:271-298`).
+- **Sample interval** (resolved 2026-05-01): stored in `Config.sample_interval_ms` (default 1500 ms), user-settable via the slider in the popup, persisted via `config.write_entry`. The subscription re-keys on the clamped interval so the poll loop restarts only on slider release.
+- **Device match filter** (resolved 2026-05-01): replaced by automatic enumeration via `liquidctl::list_devices()` plus a user-overridable dropdown. `Config.device_match: Option<String>` (`#[version = 3]`) stores the explicit pick; `None` means "auto-detect". `AppModel::effective_match()` resolves config-or-auto into the description passed to `liquidctl --match`. Subscription re-keys on `(interval_ms, match_str)` so changing either tears down and restarts the poll loop.
 
 ### Reliability Chain from Poll to Display
 

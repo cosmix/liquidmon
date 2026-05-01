@@ -55,9 +55,22 @@ Runtime-managed fields first (`core`), then UI state (`popup`), then persisted s
 
 Public types that cross module boundaries derive `Debug` and `Clone` (liquidctl.rs:12-31). Private deserialization intermediaries derive only `Debug` and `Deserialize` (liquidctl.rs:95-111).
 
-### Config struct (config.rs:5-7)
+### Config struct (config.rs)
 
-Derives `Debug`, `Default`, `Clone`, `CosmicConfigEntry`, `Eq`, `PartialEq`. Has `#[version = 1]` attribute. Currently an empty braced struct (`pub struct Config {}`); `CosmicConfigEntry` derive accepts empty structs.
+Derives `Debug`, `Clone`, `CosmicConfigEntry`, `Eq`, `PartialEq`. `#[version = 3]`. The `Default` impl is hand-written (NOT `#[derive(Default)]`) so each field's default is explicit and reviewable. The hand-written `Default` is also what `CosmicConfigEntry::get_entry`'s field-by-field fallback consults when upgrading an older on-disk config that's missing newer keys.
+
+### Option<T>-as-"auto" config convention
+
+Fields whose `None` value carries domain meaning (e.g. "auto-detect at runtime", "use the framework default") are typed as `Option<T>` rather than a sentinel value:
+
+```rust
+pub struct Config {
+    pub sample_interval_ms: u64,           // numeric — default value is meaningful
+    pub device_match: Option<String>,      // None = "auto-detect at runtime"
+}
+```
+
+The hand-written `Default` initializes the option to `None`. Resolution into the effective value is encapsulated in a private method on `AppModel` (e.g. `effective_match()`) so the auto-vs-explicit logic lives in exactly one place. Don't paper over this with a magic empty string or sentinel — `Option` makes the "unset → fallback" semantics explicit at every call site.
 
 ---
 

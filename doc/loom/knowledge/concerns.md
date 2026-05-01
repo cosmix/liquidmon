@@ -3,9 +3,20 @@
 > Technical debt, warnings, issues, and improvements needed.
 > This file is append-only - agents add discoveries, never delete.
 
-## Hardcoded device match string
+## Hardcoded device match string — RESOLVED 2026-05-01
 
-`src/app.rs:229` passes the literal string `"Hydro"` to `fetch_status()` on every poll tick. This is not derived from the `Config` struct and cannot be changed by the user without recompiling. The intended fix is to add a `device_filter: String` field to `Config` and thread it through the subscription. The match filter is a positional argument to `liquidctl --match`, so any device whose description does not contain `"Hydro"` will never be detected.
+Originally `src/app.rs` passed the literal string `"Hydro"` to `fetch_status()` on every poll tick, locking the applet to Corsair Hydro descriptions and silently excluding every other liquidctl-supported AIO family.
+
+**Resolved 2026-05-01:** Replaced with automatic enumeration plus a user-overridable dropdown:
+
+- `Config` gained `device_match: Option<String>` (`#[version = 3]`, default `None`).
+- New module `src/devices.rs` carries the lowercase substring catalog `AIO_PATTERNS` (currently `"hydro"` and `"icue h"` — families verified against the parser schema) plus pure helpers `is_aio`, `filter_aios`, and `auto_select`.
+- New `liquidctl::list_devices() -> Vec<DetectedDevice>` enumerates connected devices (`liquidctl list --json`, 1 s timeout).
+- `AppModel::effective_match()` resolves config-or-auto into the description sent to `liquidctl --match`. The poll subscription is keyed on `(interval_ms, match_str)` so changing the device tears down and restarts the loop. When no AIO is detected and no choice is saved, no poll subscription runs at all — preventing a spurious "no AIO" error during the brief startup-enumerate window.
+- The popup dropdown shows `Auto (<description>)` plus all detected AIOs and a synthetic `<saved> (disconnected)` entry when the saved choice is offline.
+- All `liquidctl` subprocess calls now serialize behind `LIQUIDCTL_LOCK: tokio::sync::Mutex<()>` to prevent the popup-open enumerate from racing with an in-flight poll on the same `/dev/hidrawN` claim.
+
+Follow-ups deferred to `PLAN-aio-broad-support.md` (broader liquidctl families requiring parser changes) and a `--bus`/`--address` plan (truly-unique selection for two identical AIOs).
 
 ## Hardcoded polling interval — RESOLVED 2026-05-01
 
