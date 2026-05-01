@@ -7,8 +7,8 @@
 //! sub-degree sensor noise don't get amplified into apparent chaos.
 
 use cosmic::Theme;
-use cosmic::iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use cosmic::iced::widget::canvas::gradient::Linear;
+use cosmic::iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use cosmic::iced::{Color, Point, Rectangle, Renderer, mouse};
 
 /// Smallest y-axis span the sparkline will ever use, in the same units as
@@ -71,12 +71,9 @@ fn y_range(samples: &[f64]) -> (f64, f64) {
 fn area_gradient(accent: Color, bounds: Rectangle) -> Linear {
     let top = Color { a: 0.55, ..accent };
     let bottom = Color { a: 0.0, ..accent };
-    Linear::new(
-        Point::new(0.0, 0.0),
-        Point::new(0.0, bounds.height),
-    )
-    .add_stop(0.0, top)
-    .add_stop(1.0, bottom)
+    Linear::new(Point::new(0.0, 0.0), Point::new(0.0, bounds.height))
+        .add_stop(0.0, top)
+        .add_stop(1.0, bottom)
 }
 
 impl<Message> canvas::Program<Message, Theme> for Sparkline {
