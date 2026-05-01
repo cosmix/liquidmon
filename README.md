@@ -129,6 +129,7 @@ underlying error is shown at the bottom.
 ```sh
 cargo test                # run unit tests
 just check                # cargo clippy --all-features -- -W clippy::pedantic
+just ci-local             # fmt --check + clippy -D warnings + test + release build
 just run                  # build release and run with RUST_BACKTRACE=full
 ```
 
@@ -137,6 +138,30 @@ Vendored offline builds:
 ```sh
 just vendor && just build-vendored
 ```
+
+### Git hooks
+
+The repo ships fast-feedback hooks in `.githooks/` that mirror CI so a
+push doesn't fail after a tag is cut. Wire them into your local clone
+once with:
+
+```sh
+just hooks
+# or, without `just`:
+./.githooks/install.sh
+```
+
+That points `core.hooksPath` at `.githooks/`, giving you:
+
+- `pre-commit` — `cargo fmt --check` and `cargo clippy -D warnings` on
+  any commit that touches `*.rs`, `Cargo.toml`, or `Cargo.lock`. Skipped
+  on rebases and merges.
+- `pre-push` — `cargo test --all-features` plus `cargo audit` (if
+  installed) and a tag-vs-Cargo.toml version match check on tag pushes.
+
+Optional dependency-CVE scanning needs `cargo install cargo-audit --locked`
+once. Push-time bypasses if you really need them: `git push --no-verify`
+or `LIQUIDMON_SKIP_AUDIT=1 git push ...` (skips just the audit step).
 
 ### Running as a standalone window
 

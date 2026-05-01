@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Fast checks gated on every commit. Mirrors the first two steps of CI
+# (.github/workflows/ci.yml) so format/clippy violations are caught before a
+# push instead of after a tag. Skip with `git commit --no-verify` only when
+# you have a deliberate reason — the same checks will run in CI.
+
+set -euo pipefail
+
+# Skip on rebase / merge / amend-of-empty-tree to avoid blocking common flows.
+if [[ -n "${GIT_REBASE:-}" ]] || [[ -f .git/MERGE_HEAD ]]; then
+    exit 0
+fi
+
+red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+# Only act when Rust sources or Cargo manifests are staged.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.(rs|toml)$|^Cargo\.lock$'; then
+    exit 0
+fi
+
+yellow "pre-commit: cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    red "pre-commit: rustfmt found unformatted code. Run 'cargo fmt --all' and re-stage."
+    exit 1
+fi
+
+yellow "pre-commit: cargo clippy --all-targets --all-features -- -D warnings"
+if ! cargo clippy --all-targets --all-features --no-deps -- -D warnings; then
+    red "pre-commit: clippy reported warnings (treated as errors in CI)."
+    exit 1
+fi
+
+green "pre-commit: ok"

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Slower checks gated on push. Runs the test suite and (optionally) a
+# cargo-audit pass for known CVEs in the dependency tree. Skip the entire
+# hook with `git push --no-verify` if you have a reason; skip just the audit
+# step by setting LIQUIDMON_SKIP_AUDIT=1.
+
+set -euo pipefail
+
+red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+yellow "pre-push: cargo test --all-features --no-fail-fast"
+if ! cargo test --all-features --no-fail-fast; then
+    red "pre-push: tests failed."
+    exit 1
+fi
+
+if [[ "${LIQUIDMON_SKIP_AUDIT:-0}" != "1" ]]; then
+    if command -v cargo-audit >/dev/null 2>&1; then
+        yellow "pre-push: cargo audit"
+        if ! cargo audit --quiet; then
+            red "pre-push: cargo-audit found advisories. Review the report above."
+            red "  - update affected crates with 'cargo update -p <crate>' if a fix is available"
+            red "  - or set LIQUIDMON_SKIP_AUDIT=1 git push <args> to push regardless"
+            exit 1
+        fi
+    else
+        yellow "pre-push: cargo-audit not installed — skipping CVE scan."
+        yellow "  install with 'cargo install cargo-audit --locked' to enable it."
+    fi
+fi
+
+# Tag-bound pushes: enforce that Cargo.toml version matches the tag being pushed.
+# stdin format (one per line): <local-ref> <local-sha> <remote-ref> <remote-sha>
+while read -r local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/tags/v*)
+            tag_version="${remote_ref#refs/tags/v}"
+            cargo_version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+                red "pre-push: tag '$remote_ref' does not match Cargo.toml version '$cargo_version'."
+                red "  Use 'just tag <version>' to keep Cargo.toml and the tag in sync."
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+green "pre-push: ok"

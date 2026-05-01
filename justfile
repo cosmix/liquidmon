@@ -43,6 +43,21 @@ check *args:
 # Runs a clippy check with JSON message format
 check-json: (check '--message-format=json')
 
+# Mirrors CI exactly — fmt --check + clippy -D warnings + test + release build
+ci-local:
+    cargo fmt --all -- --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --all-features --no-fail-fast
+    cargo build --release
+
+# Audit dependencies for known CVEs (requires `cargo install cargo-audit`)
+audit:
+    cargo audit
+
+# Install repo-tracked git hooks (pre-commit fmt+clippy, pre-push test+audit)
+hooks:
+    ./.githooks/install.sh
+
 # Run the application for testing purposes
 run *args:
     env RUST_BACKTRACE=full cargo run --release {{args}}
