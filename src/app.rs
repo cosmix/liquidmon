@@ -519,31 +519,46 @@ impl AppModel {
             .width(Length::Fixed(320.0))
             .height(Length::Fixed(80.0));
 
+        // Single shared row format. With the mono font, identical column
+        // widths in the format string translate directly to vertical column
+        // alignment between the avg row and every per-fan row.
+        let row_fmt = |label: &str, rpm: u32, duty: u8| -> String {
+            format!("{label:<6}{rpm:>5} rpm   {duty:>3} %")
+        };
+
         let avg_line = match (fan_speed_avg(&status.fans), fan_duty_avg(&status.fans)) {
-            (Some(rpm), Some(pct)) => format!("avg   {rpm:>5} rpm   {pct:>3} %"),
+            (Some(rpm), Some(pct)) => row_fmt("avg", rpm, pct),
             _ => "—".to_string(),
         };
 
         let mut children: Vec<Element<'a, Message>> = vec![
-            widget::text::caption("Fans (avg)").into(),
+            widget::text::caption("Fans").into(),
             sparkline.into(),
-            widget::text::body(avg_line)
+            widget::text::caption(avg_line)
                 .font(cosmic::font::mono())
                 .into(),
         ];
 
-        // Per-fan rows: mono columns so rpm/duty digits stack vertically.
-        // Width budget at 320 px popup leaves room for ~26 chars per row.
-        for fan in &status.fans {
+        // Per-fan rows live in a tightly-spaced sub-column so the breakdown
+        // reads as a compact group. They share font + format string with the
+        // avg row above so the rpm and duty digits line up vertically.
+        if !status.fans.is_empty() {
+            let mut fan_rows: Vec<Element<'a, Message>> = Vec::with_capacity(status.fans.len());
+            for fan in &status.fans {
+                fan_rows.push(
+                    widget::text::caption(row_fmt(
+                        &format!("fan {}", fan.index),
+                        fan.speed_rpm,
+                        fan.duty_pct,
+                    ))
+                    .font(cosmic::font::mono())
+                    .into(),
+                );
+            }
             children.push(
-                widget::text::caption(format!(
-                    "fan {idx:>2}   {rpm:>5} rpm   {duty:>3} %",
-                    idx = fan.index,
-                    rpm = fan.speed_rpm,
-                    duty = fan.duty_pct,
-                ))
-                .font(cosmic::font::mono())
-                .into(),
+                cosmic::iced::widget::Column::with_children(fan_rows)
+                    .spacing(1)
+                    .into(),
             );
         }
 
