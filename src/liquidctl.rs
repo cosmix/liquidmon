@@ -5,8 +5,14 @@
 use serde::Deserialize;
 use std::fmt;
 use std::io;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::Mutex;
+
+/// Serializes all `liquidctl` subprocess calls to prevent concurrent HID
+/// device access conflicts (the driver opens an exclusive `O_RDWR` claim).
+static LIQUIDCTL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Parsed status snapshot for a single AIO device.
 #[derive(Debug, Clone)]
@@ -28,6 +34,19 @@ pub struct Fan {
     pub index: u8,
     pub speed_rpm: u32,
     pub duty_pct: u8,
+}
+
+/// A device returned by `liquidctl list --json`.
+#[derive(Debug, Clone)]
+pub struct DetectedDevice {
+    pub description: String,
+    // bus/address are parsed and exposed for a follow-up plan that will
+    // disambiguate identical AIOs via `--bus X --address Y`. v1 selects
+    // by description only; the fields ride through unread for now.
+    #[allow(dead_code)]
+    pub bus: String,
+    #[allow(dead_code)]
+    pub address: String,
 }
 
 #[derive(Debug)]
@@ -102,6 +121,7 @@ struct StatusEntry {
 /// Runs `liquidctl --match <match_filter> --json status`, parses the first
 /// device with a non-empty `status` array, and returns its parsed AioStatus.
 pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
+    let _guard = LIQUIDCTL_LOCK.lock().await;
     let mut cmd = Command::new("liquidctl");
     cmd.args(["--match", match_filter, "--json", "status"])
         .kill_on_drop(true);
@@ -210,6 +230,79 @@ fn split_fan_key(rest: &str) -> Option<(u8, &str)> {
         return None;
     }
     Some((num, suffix))
+}
+
+/// Runs `liquidctl list --json` (no `--match`), enumerates every device
+/// liquidctl can see, and returns the parsed list.
+///
+/// A 1 s timeout is used — `list` is purely an HID enumeration with no
+/// on-device transaction, so 3 s is unnecessarily generous.
+pub async fn list_devices() -> Result<Vec<DetectedDevice>, Error> {
+    let _guard = LIQUIDCTL_LOCK.lock().await;
+    let mut cmd = Command::new("liquidctl");
+    cmd.args(["list", "--json"]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(1), cmd.output())
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(Error::Spawn)?;
+
+    if !output.status.success() {
+        return Err(Error::NonZeroExit {
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    let raw = std::str::from_utf8(&output.stdout).map_err(|e| {
+        Error::Spawn(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("liquidctl produced non-UTF-8 stdout: {e}"),
+        ))
+    })?;
+    parse_devices_response(raw)
+}
+
+/// Parses raw `liquidctl list --json` output into a list of [`DetectedDevice`].
+///
+/// Returns `Ok(vec![])` when liquidctl reports no devices (an empty JSON array
+/// is valid — this is distinct from [`Error::NoDevice`], which only
+/// `fetch_status` produces when no device has a usable status array).
+fn parse_devices_response(raw: &str) -> Result<Vec<DetectedDevice>, Error> {
+    let entries: Vec<ListDeviceEntry> = serde_json::from_str(raw)?;
+    Ok(entries
+        .into_iter()
+        .map(|e| DetectedDevice {
+            description: e.description,
+            bus: e.bus,
+            address: e.address,
+        })
+        .collect())
+}
+
+/// Private deserialization helper for `liquidctl list --json` entries.
+/// Fields beyond `description`, `bus`, and `address` are intentionally
+/// omitted — serde ignores unknown keys by default.
+#[derive(Debug, Deserialize)]
+struct ListDeviceEntry {
+    description: String,
+    /// Tolerant: liquidctl normally emits a string (`"hid"`, `"usb"`), but
+    /// defensive deserialization via `serde_json::Value` protects against
+    /// future driver changes that emit null or a numeric value.
+    #[serde(deserialize_with = "deserialize_string_lossy")]
+    bus: String,
+    /// Same defensive treatment — USB addresses can in principle be numeric
+    /// tuples in some liquidctl backends.
+    #[serde(deserialize_with = "deserialize_string_lossy")]
+    address: String,
+}
+
+fn deserialize_string_lossy<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
 }
 
 #[cfg(test)]
@@ -478,5 +571,59 @@ mod tests {
         assert!(Error::NoDevice.source().is_none());
         assert!(Error::MissingField("x").source().is_none());
         assert!(Error::Timeout.source().is_none());
+    }
+
+    // ── list_devices / parse_devices_response tests ──────────────────────────
+
+    const LIST_FIXTURE: &str = r#"[{"bus":"hid","address":"/dev/hidraw0","description":"Gigabyte RGB Fusion 2.0 8297 Controller","vendor_id":6357,"product_id":33122,"release_number":256,"serial_number":"5C7E0EFAA1E5","port":"3","driver":"RgbFusion2","experimental":false},{"bus":"hid","address":"/dev/hidraw1","description":"Corsair Hydro H150i Pro XT","vendor_id":6940,"product_id":3107,"release_number":256,"serial_number":"1234ABCD","port":"4","driver":"HydroPlatinum","experimental":false}]"#;
+
+    #[test]
+    fn parses_multiple_devices_from_list_fixture() {
+        let devices = parse_devices_response(LIST_FIXTURE).expect("fixture should parse");
+        assert_eq!(devices.len(), 2);
+
+        assert_eq!(
+            devices[0].description,
+            "Gigabyte RGB Fusion 2.0 8297 Controller"
+        );
+        assert_eq!(devices[0].bus, "hid");
+        assert_eq!(devices[0].address, "/dev/hidraw0");
+
+        assert_eq!(devices[1].description, "Corsair Hydro H150i Pro XT");
+        assert_eq!(devices[1].bus, "hid");
+        assert_eq!(devices[1].address, "/dev/hidraw1");
+    }
+
+    #[test]
+    fn empty_list_yields_empty_vec() {
+        // An empty JSON array is valid for `liquidctl list` — no device is
+        // connected. This is distinct from Error::NoDevice, which only
+        // fetch_status produces when devices are present but none has a
+        // usable status array.
+        let result = parse_devices_response("[]").expect("empty array should not fail");
+        assert!(
+            result.is_empty(),
+            "expected empty vec (not Error::NoDevice) for empty list output"
+        );
+    }
+
+    #[test]
+    fn malformed_list_yields_parse_error() {
+        match parse_devices_response("garbage") {
+            Err(Error::Parse(_)) => {}
+            other => panic!("expected Error::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_device_entry_ignores_unknown_fields() {
+        // Minimal fixture: only the three fields we care about plus one unknown.
+        let raw = r#"[{"description":"Test Device","bus":"hid","address":"/dev/hidraw0","experimental":true}]"#;
+        let devices = parse_devices_response(raw)
+            .expect("entry with unknown fields should deserialize successfully");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].description, "Test Device");
+        assert_eq!(devices[0].bus, "hid");
+        assert_eq!(devices[0].address, "/dev/hidraw0");
     }
 }
