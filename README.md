@@ -2,16 +2,17 @@
 
 LiquidMon is a COSMIC panel applet that monitors Corsair Hydro AIO coolers in
 real time via the [`liquidctl`][liquidctl] CLI. The panel button shows the
-current liquid temperature, a rolling 90-second sparkline of recent samples,
-average fan duty %, and pump duty %. Clicking it opens a popup with the full
-device description, liquid temperature, pump speed and duty, and per-fan
-speed and duty for every fan the AIO reports.
+current liquid temperature, a gradient-filled sparkline of recent samples,
+average fan duty %, and pump duty %. Clicking it opens a popup with the
+device description, three large 15-minute sparklines (coolant temperature,
+pump duty, fan-average duty), and a slider that sets the sample interval
+(1.0 s – 10.0 s, persisted via cosmic-config).
 
-The applet polls `liquidctl --json status` every 1.5 seconds with a 3-second
-per-call timeout. If a poll fails, the last successful reading is kept on
-display and the popup shows the underlying error — so a frozen temperature
-reading combined with an error in the popup means liquidctl has stopped
-responding.
+The applet polls `liquidctl --json status` at the configured interval (default
+1.5 s) with a 3-second per-call timeout. If a poll fails, the last successful
+reading is kept on display and the popup shows the underlying error — so a
+frozen temperature reading combined with an error in the popup means liquidctl
+has stopped responding.
 
 App ID: `com.github.cosmix.LiquidMon`
 
@@ -109,9 +110,10 @@ Common causes:
 
 **Panel shows `…`**
 
-No reading has arrived yet. Polling runs every 1.5 seconds with a 3-second
-per-call timeout, so a steady `…` for more than 5 seconds means liquidctl
-is hanging or the subscription failed to start. Check the COSMIC panel log:
+No reading has arrived yet. Polling runs at the configured sample interval
+(1.5 s by default) with a 3-second per-call timeout, so a steady `…` for
+more than the interval plus 3 s means liquidctl is hanging or the
+subscription failed to start. Check the COSMIC panel log:
 
 ```sh
 journalctl --user -u cosmic-panel
@@ -135,6 +137,47 @@ Vendored offline builds:
 ```sh
 just vendor && just build-vendored
 ```
+
+### Running as a standalone window
+
+When the binary is launched outside the COSMIC panel, libcosmic falls back
+to rendering the applet as a small standalone Wayland window — the panel
+button becomes a clickable window, and clicking it opens the popup as an
+`xdg_popup` anchored to that window. This is the fastest way to iterate
+on UI changes without reinstalling into `/usr/bin` or restarting
+`cosmic-panel`.
+
+```sh
+just run
+# or, with a debug build:
+cargo run
+```
+
+A few `COSMIC_PANEL_*` environment variables that the panel normally sets
+can be set manually to influence layout — useful for testing different
+panel configurations:
+
+```sh
+# Render the applet button at a larger size (XS|S|M|L|XL or Custom(N))
+COSMIC_PANEL_SIZE=XL just run
+
+# Pretend we're docked to the bottom edge (Top|Bottom|Left|Right)
+COSMIC_PANEL_ANCHOR=Bottom just run
+```
+
+Requirements and caveats:
+
+- A Wayland session is required (the COSMIC desktop or another Wayland
+  compositor that supports `xdg_popup`). On X11/XWayland the popup
+  positioning APIs are unavailable.
+- `liquidctl` must be on `PATH` and the udev rules must be installed —
+  the standalone window calls the same subprocess as the installed
+  applet, so a missing rule produces the same `!` error state.
+- `RUST_LOG=liquidmon=debug,cosmic=warn cargo run` raises the log level
+  for the applet without flooding the terminal with libcosmic chatter.
+- The standalone window has no decorations; close it with the
+  compositor's window close shortcut (`Super+Q` on COSMIC) or `Ctrl+C`
+  in the terminal.
 
 ## License
 
