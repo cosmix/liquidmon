@@ -16,9 +16,22 @@ use cosmic::iced::{Color, Point, Rectangle, Renderer, mouse};
 /// the band is centered on the data midpoint so the trace renders mid-canvas.
 const MIN_Y_SPAN: f64 = 2.0;
 
+/// Selects which theme color the sparkline tints itself with. `Accent` is the
+/// vibrant accent (right for popups where the canvas sits on the panel/popup
+/// surface) — but the panel applet itself often sits on top of the wallpaper,
+/// where accent can disappear. `OnPanel` follows the panel's foreground text
+/// color (`background.on`), which always contrasts the panel chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SparklineTint {
+    #[default]
+    Accent,
+    OnPanel,
+}
+
 pub struct Sparkline {
     samples: Vec<f64>,
     stroke_alpha: f32,
+    tint: SparklineTint,
 }
 
 impl Sparkline {
@@ -26,12 +39,18 @@ impl Sparkline {
         Self {
             samples: samples.into_iter().collect(),
             stroke_alpha: 0.95,
+            tint: SparklineTint::default(),
         }
     }
 
     #[allow(dead_code)]
     pub fn with_stroke_alpha(mut self, alpha: f32) -> Self {
         self.stroke_alpha = alpha;
+        self
+    }
+
+    pub fn with_tint(mut self, tint: SparklineTint) -> Self {
+        self.tint = tint;
         self
     }
 }
@@ -66,11 +85,12 @@ fn y_range(samples: &[f64]) -> (f64, f64) {
     }
 }
 
-/// Build a vertical linear gradient (top = opaque accent, bottom = transparent)
-/// that spans the full frame height.
-fn area_gradient(accent: Color, bounds: Rectangle) -> Linear {
-    let top = Color { a: 0.55, ..accent };
-    let bottom = Color { a: 0.0, ..accent };
+/// Build a vertical linear gradient (top = tinted at ~half alpha, bottom = transparent)
+/// that spans the full frame height. `tint` is whatever theme color the
+/// sparkline picked — accent for popup, panel-foreground for the panel button.
+fn area_gradient(tint: Color, bounds: Rectangle) -> Linear {
+    let top = Color { a: 0.55, ..tint };
+    let bottom = Color { a: 0.0, ..tint };
     Linear::new(Point::new(0.0, 0.0), Point::new(0.0, bounds.height))
         .add_stop(0.0, top)
         .add_stop(1.0, bottom)
@@ -100,16 +120,19 @@ impl<Message> canvas::Program<Message, Theme> for Sparkline {
         let (y_min, y_max) = y_range(&self.samples);
         let range = y_max - y_min;
 
-        let srgba = theme.cosmic().accent.base;
-        let accent = Color {
+        let cosmic_theme = theme.cosmic();
+        let srgba = match self.tint {
+            SparklineTint::Accent => cosmic_theme.accent.base,
+            SparklineTint::OnPanel => cosmic_theme.background.on,
+        };
+        let tinted = Color {
             r: srgba.red,
             g: srgba.green,
             b: srgba.blue,
             a: self.stroke_alpha,
         };
-        let stroke_color = accent;
-        let stroke = Stroke::default().with_color(stroke_color).with_width(1.5);
-        let gradient = area_gradient(accent, bounds);
+        let stroke = Stroke::default().with_color(tinted).with_width(1.5);
+        let gradient = area_gradient(tinted, bounds);
 
         // Single-sample case: draw a filled rectangle under the tick so the
         // sparkline is visible immediately after the first poll, instead of

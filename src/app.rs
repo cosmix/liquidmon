@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
-use crate::sparkline::Sparkline;
+use crate::sparkline::{Sparkline, SparklineTint};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
@@ -200,9 +200,13 @@ impl cosmic::Application for AppModel {
                     .iter()
                     .copied()
                     .skip(self.temp_history.len().saturating_sub(PANEL_SPARK_SAMPLES));
-                let sparkline = Canvas::new(Sparkline::new(panel_iter))
-                    .width(Length::Fixed(36.0))
-                    .height(Length::Fixed(16.0));
+                // Tint the panel sparkline with the panel foreground color so
+                // it stays visible regardless of wallpaper. Popup sparklines
+                // (built in `popup_metrics_view`) keep the accent default.
+                let sparkline =
+                    Canvas::new(Sparkline::new(panel_iter).with_tint(SparklineTint::OnPanel))
+                        .width(Length::Fixed(36.0))
+                        .height(Length::Fixed(16.0));
 
                 let coolant_glyph = row![symbolic_icon(ICON_SNOWFLAKE), symbolic_icon(ICON_TEMP),]
                     .spacing(1)
@@ -371,11 +375,11 @@ impl AppModel {
         status: &'a crate::liquidctl::AioStatus,
         maybe_err: Option<&'a str>,
     ) -> Element<'a, Message> {
-        let pump_text = format!("{} rpm   {} %", status.pump.speed_rpm, status.pump.duty_pct);
-        let fan_text = match (fan_speed_avg(&status.fans), fan_duty_avg(&status.fans)) {
-            (Some(rpm), Some(pct)) => format!("{rpm} rpm   {pct} %"),
-            _ => "—".to_string(),
-        };
+        let pump_text = format!(
+            "{rpm:>5} rpm   {duty:>3} %",
+            rpm = status.pump.speed_rpm,
+            duty = status.pump.duty_pct,
+        );
 
         // Live drag value falls back to the persisted setting when not dragging.
         // The slider itself is f32; the persisted value is u64 ms — the cast is
@@ -404,7 +408,7 @@ impl AppModel {
             80.0,
             pump_text,
         ));
-        sections.push(self.fans_section(status, fan_text));
+        sections.push(self.fans_section(status));
         sections.push(
             column![
                 widget::text::body(format!("Sample interval: {secs:.1} s")),
@@ -425,37 +429,41 @@ impl AppModel {
         .into()
     }
 
-    /// Fans section: average duty sparkline + average rpm/duty body, plus a
-    /// compact per-fan rpm/duty line so non-uniform fans stay visible at a
-    /// glance. Falls back to the bare avg row when the device reports no fans.
-    fn fans_section<'a>(
-        &'a self,
-        status: &'a crate::liquidctl::AioStatus,
-        avg_text: String,
-    ) -> Element<'a, Message> {
+    /// Fans section: average-duty sparkline, average row in body mono, then
+    /// one mono caption row per fan with right-aligned numeric columns so the
+    /// rpm and duty values line up vertically — non-uniform fans stay easy to
+    /// spot at a glance. Falls back to a single em-dash row when the device
+    /// reports no fans.
+    fn fans_section<'a>(&'a self, status: &'a crate::liquidctl::AioStatus) -> Element<'a, Message> {
         let sparkline = Canvas::new(Sparkline::new(self.fan_avg_duty_history.iter().copied()))
             .width(Length::Fixed(320.0))
             .height(Length::Fixed(80.0));
 
+        let avg_line = match (fan_speed_avg(&status.fans), fan_duty_avg(&status.fans)) {
+            (Some(rpm), Some(pct)) => format!("avg   {rpm:>5} rpm   {pct:>3} %"),
+            _ => "—".to_string(),
+        };
+
         let mut children: Vec<Element<'a, Message>> = vec![
             widget::text::caption("Fans (avg)").into(),
             sparkline.into(),
-            widget::text::body(avg_text)
+            widget::text::body(avg_line)
                 .font(cosmic::font::mono())
                 .into(),
         ];
 
-        if !status.fans.is_empty() {
-            let per_fan = status
-                .fans
-                .iter()
-                .map(|f| format!("{} {}rpm/{}%", f.index, f.speed_rpm, f.duty_pct))
-                .collect::<Vec<_>>()
-                .join("  ·  ");
+        // Per-fan rows: mono columns so rpm/duty digits stack vertically.
+        // Width budget at 320 px popup leaves room for ~26 chars per row.
+        for fan in &status.fans {
             children.push(
-                widget::text::caption(per_fan)
-                    .font(cosmic::font::mono())
-                    .into(),
+                widget::text::caption(format!(
+                    "fan {idx:>2}   {rpm:>5} rpm   {duty:>3} %",
+                    idx = fan.index,
+                    rpm = fan.speed_rpm,
+                    duty = fan.duty_pct,
+                ))
+                .font(cosmic::font::mono())
+                .into(),
             );
         }
 
