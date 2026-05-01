@@ -3,7 +3,7 @@ name = "liquidmon"
 version = "0.2.0"
 edition = "2024"
 license = "MPL-2.0"
-description = "COSMIC panel applet for Corsair AIO temps and fan/pump duties via liquidctl"
+description = "COSMIC panel applet for AIO liquid cooler temps and fan/pump duties via liquidctl"
 repository = "https://github.com/cosmix/liquidmon"
 authors = ["Dimosthenis Kaponis <dkaponis@gmail.com>"]
 
@@ -13,8 +13,10 @@ section = "utility"
 priority = "optional"
 depends = "$auto, liquidctl"
 extended-description = """\
-LiquidMon is a COSMIC panel applet that surfaces Corsair AIO liquid \
-cooler temperatures and pump/fan duty controls. It shells out to \
+LiquidMon is a COSMIC panel applet that surfaces AIO liquid cooler \
+temperatures and pump/fan duty controls. Currently supports Corsair \
+Hydro Pro/Pro XT/Platinum and iCUE Elite Capellix/RGB families; \
+broader liquidctl device support is planned. It shells out to \
 liquidctl for device access, so liquidctl must be installed and \
 configured with appropriate udev rules."""
 assets = [

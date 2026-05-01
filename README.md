@@ -1,6 +1,6 @@
 # LiquidMon
 
-LiquidMon is a COSMIC panel applet that monitors Corsair Hydro AIO coolers in
+LiquidMon is a COSMIC panel applet that monitors AIO liquid coolers in
 real time via the [`liquidctl`][liquidctl] CLI. The panel button shows the
 current liquid temperature, a gradient-filled sparkline of recent samples,
 average fan duty %, and pump duty %. Clicking it opens a popup with the
@@ -18,11 +18,27 @@ App ID: `com.github.cosmix.LiquidMon`
 
 ## Supported Devices
 
-Any Corsair AIO whose `liquidctl status` description contains the word `Hydro`
-— for example: Hydro H100i, H115i, H150i Pro XT, H170i.
+LiquidMon ships v1 with verified support for two AIO families:
 
-> **Note:** the device match filter is currently hardcoded to `"Hydro"`.
-> Configurable matching is a future feature.
+- **Corsair Hydro Pro / Pro XT / Platinum** (e.g. H100i, H115i, H150i Pro XT, H170i)
+- **Corsair iCUE Elite Capellix / RGB** (e.g. H100i Elite Capellix, H150i Elite RGB)
+
+Connected liquidctl devices are enumerated on launch and when the popup is
+opened. The first compatible AIO is auto-selected; a dropdown in the popup
+lets you override the choice when more than one is connected. The selected
+device is persisted via cosmic-config and survives applet restart.
+
+Broader liquidctl device support (NZXT Kraken, EVGA CLC, Aquacomputer D5
+Next, MSI Coreliquid, ASUS Ryujin, Lian Li Galahad II LCD) is planned —
+those families ship under a separate parser change.
+
+### Limitations
+
+- **One device per cooler family.** When two identical AIOs are connected,
+  liquidctl's substring match selects the first; v1 cannot disambiguate
+  truly-identical devices.
+- **Hot-plug detected on popup open.** Plugging in a new cooler does not
+  auto-update the panel; open the popup once to trigger re-enumeration.
 
 ## Install
 
@@ -95,11 +111,12 @@ Then replug the AIO's internal USB header (or reboot) so existing
 
 **Panel shows `!`**
 
-The most recent `liquidctl` call failed. Reproduce the underlying error
-from a terminal:
+The most recent `liquidctl` call failed. Enumerate connected devices and
+reproduce the underlying error from a terminal:
 
 ```sh
-liquidctl --match Hydro --json status
+liquidctl list --json
+liquidctl --match "<full description>" --json status
 ```
 
 Common causes:
