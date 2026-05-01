@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod devices;
 mod liquidctl;
 mod sparkline;
 
