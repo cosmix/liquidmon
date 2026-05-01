@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
+use crate::devices;
+use crate::liquidctl::DetectedDevice;
 use crate::sparkline::{Sparkline, SparklineTint};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::channel::mpsc;
@@ -110,6 +112,12 @@ pub struct AppModel {
     /// Mean fan duty across all fans, in percent (oldest first). Skipped on
     /// ticks with no fans so the y-axis auto-scaler isn't dragged toward zero.
     fan_avg_duty_history: VecDeque<f64>,
+    /// Devices observed at the last `liquidctl list` enumeration. Filtered to
+    /// AIOs via `devices::filter_aios` when used by the dropdown.
+    detected_devices: Vec<DetectedDevice>,
+    /// True while a `liquidctl list` task is in flight, so the popup can
+    /// show a "Detecting devices…" placeholder and avoid concurrent requests.
+    device_scan_in_flight: bool,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -123,6 +131,10 @@ pub enum Message {
     SampleIntervalDragged(f32),
     /// Fired once when the slider is released — commits and persists.
     SampleIntervalReleased,
+    /// Result of a `liquidctl list --json` enumeration.
+    DevicesEnumerated(Result<Vec<DetectedDevice>, String>),
+    /// User chose a device from the popup dropdown. `None` means revert to Auto.
+    DeviceSelected(Option<String>),
 }
 
 /// Create a COSMIC application from the app model
@@ -167,10 +179,19 @@ impl cosmic::Application for AppModel {
             core,
             config,
             config_handle,
+            device_scan_in_flight: true,
             ..Default::default()
         };
 
-        (app, Task::none())
+        let init_task = Task::perform(
+            async {
+                crate::liquidctl::list_devices()
+                    .await
+                    .map_err(|e| format!("{e}"))
+            },
+            |r| cosmic::Action::App(Message::DevicesEnumerated(r)),
+        );
+        (app, init_task)
     }
 
     fn on_close_requested(&self, id: Id) -> Option<Message> {
@@ -263,38 +284,47 @@ impl cosmic::Application for AppModel {
     /// activated by selectively appending to the subscription batch, and will
     /// continue to execute for the duration that they remain in the batch.
     fn subscription(&self) -> Subscription<Self::Message> {
-        // Subscription identity is the (data, fn-pointer) pair: keying on the
-        // interval means iced tears down and restarts the poll loop only when
-        // the user commits a new interval (drag-release), not on every drag
-        // tick. `run_with` requires a real fn pointer, so we cannot capture —
-        // the interval rides through as `data`.
-        let interval_ms = self
-            .config
-            .sample_interval_ms
-            .clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS);
-
-        let liquidctl_sub = Subscription::run_with(interval_ms, |interval_ms: &u64| {
-            let interval_ms = *interval_ms;
-            cosmic::iced::stream::channel(4, move |mut channel: mpsc::Sender<Message>| async move {
-                loop {
-                    let result = crate::liquidctl::fetch_status("Hydro")
-                        .await
-                        .map_err(|e| format!("{e}"));
-                    if channel.send(Message::StatusTick(result)).await.is_err() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-                }
-                futures_util::future::pending().await
-            })
-        });
-
-        Subscription::batch(vec![
-            liquidctl_sub,
+        // Subscription identity is the (data, fn-pointer) pair. Keying on
+        // `(interval_ms, match_str)` means iced tears down and restarts the
+        // poll loop when EITHER the user commits a new interval OR picks a
+        // different device. Until enumeration resolves an effective match,
+        // we install no poll subscription so no spurious "no AIO detected"
+        // error is surfaced before init's enumerate task lands.
+        let mut subs: Vec<Subscription<Message>> = vec![
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
                 .map(|update| Message::UpdateConfig(update.config)),
-        ])
+        ];
+
+        if let Some(match_str) = self.effective_match() {
+            let interval_ms = self
+                .config
+                .sample_interval_ms
+                .clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS);
+            let key: (u64, String) = (interval_ms, match_str);
+
+            subs.push(Subscription::run_with(key, |key: &(u64, String)| {
+                let interval_ms = key.0;
+                let match_str = key.1.clone();
+                cosmic::iced::stream::channel(
+                    4,
+                    move |mut channel: mpsc::Sender<Message>| async move {
+                        loop {
+                            let result = crate::liquidctl::fetch_status(&match_str)
+                                .await
+                                .map_err(|e| format!("{e}"));
+                            if channel.send(Message::StatusTick(result)).await.is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                        }
+                        futures_util::future::pending().await
+                    },
+                )
+            }));
+        }
+
+        Subscription::batch(subs)
     }
 
     /// Handles messages emitted by the application and its widgets.
@@ -348,12 +378,61 @@ impl cosmic::Application for AppModel {
                         .min_width(320.0)
                         .min_height(360.0)
                         .max_height(1080.0);
-                    get_popup(popup_settings)
+                    let get_popup_task = get_popup(popup_settings);
+                    if self.device_scan_in_flight {
+                        get_popup_task
+                    } else {
+                        // Hot-plug refresh on popup open. Already gated by
+                        // `device_scan_in_flight` above; setting it here
+                        // prevents a second concurrent enumerate if the user
+                        // toggles the popup faster than `list` returns.
+                        self.device_scan_in_flight = true;
+                        let enumerate = Task::perform(
+                            async {
+                                crate::liquidctl::list_devices()
+                                    .await
+                                    .map_err(|e| format!("{e}"))
+                            },
+                            |r| cosmic::Action::App(Message::DevicesEnumerated(r)),
+                        );
+                        Task::batch(vec![get_popup_task, enumerate])
+                    }
                 };
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
+                }
+            }
+            Message::DevicesEnumerated(Ok(devs)) => {
+                let prev_effective = self.effective_match();
+                self.detected_devices = devs;
+                self.device_scan_in_flight = false;
+                let new_effective = self.effective_match();
+                if prev_effective != new_effective {
+                    self.reset_device_state();
+                }
+                if new_effective.is_none() {
+                    self.last_error = Some(
+                        "no supported AIO detected — open the popup to select a device".to_string(),
+                    );
+                }
+            }
+            Message::DevicesEnumerated(Err(msg)) => {
+                self.last_error = Some(msg);
+                self.device_scan_in_flight = false;
+            }
+            Message::DeviceSelected(choice) => {
+                if self.config.device_match != choice {
+                    let prev_effective = self.effective_match();
+                    self.config.device_match = choice;
+                    let new_effective = self.effective_match();
+                    if prev_effective != new_effective {
+                        self.reset_device_state();
+                    }
+                    if let Some(handle) = self.config_handle.as_ref() {
+                        let _ = self.config.write_entry(handle);
+                    }
                 }
             }
         }
@@ -417,6 +496,7 @@ impl AppModel {
             .spacing(4)
             .into(),
         );
+        sections.push(self.device_dropdown_section());
         if let Some(err) = maybe_err {
             sections.push(widget::text::caption(format!("error: {err}")).into());
         }
@@ -468,6 +548,113 @@ impl AppModel {
         }
 
         cosmic::iced::widget::Column::with_children(children)
+            .spacing(4)
+            .into()
+    }
+
+    /// Clear all per-device state when the effective device changes so
+    /// sparklines and last-status reflect only samples from the new device.
+    fn reset_device_state(&mut self) {
+        self.temp_history.clear();
+        self.pump_duty_history.clear();
+        self.fan_avg_duty_history.clear();
+        self.last_status = None;
+        self.last_error = None;
+    }
+
+    /// Resolve the effective `--match` filter: user's saved choice takes
+    /// precedence; otherwise fall back to the auto-selected AIO from the
+    /// last enumeration. `None` means no AIO is available.
+    fn effective_match(&self) -> Option<String> {
+        self.config
+            .device_match
+            .clone()
+            .or_else(|| devices::auto_select(&self.detected_devices).map(|d| d.description.clone()))
+    }
+
+    /// Build the device dropdown items: `Auto (...)` at index 0, then each
+    /// connected AIO that isn't the auto-pick (the auto entry already names
+    /// it), then optionally a synthetic `<saved> (disconnected)` row if the
+    /// saved choice isn't currently connected.
+    fn device_dropdown_items(&self) -> Vec<String> {
+        let aios: Vec<&DetectedDevice> = devices::filter_aios(&self.detected_devices);
+        let auto_pick = devices::auto_select(&self.detected_devices);
+        let auto_label = match auto_pick {
+            Some(d) => format!("Auto ({})", d.description),
+            None => "Auto (no AIO detected)".to_string(),
+        };
+
+        let mut items = vec![auto_label];
+        let auto_desc = auto_pick.map(|d| d.description.as_str());
+        items.extend(
+            aios.iter()
+                .filter(|d| Some(d.description.as_str()) != auto_desc)
+                .map(|d| d.description.clone()),
+        );
+
+        if let Some(saved) = self.config.device_match.as_ref()
+            && !aios.iter().any(|d| &d.description == saved)
+        {
+            items.push(format!("{saved} (disconnected)"));
+        }
+        items
+    }
+
+    /// Resolve the currently-selected dropdown index. `None` (saved choice
+    /// is unset) maps to index 0 (Auto). A saved choice that matches the
+    /// auto-pick also maps to Auto, since the explicit row is intentionally
+    /// hidden from the list to avoid duplicating the device under both Auto
+    /// and a standalone entry. Otherwise the saved choice maps to its row
+    /// (connected or `(disconnected)` synthetic).
+    fn device_dropdown_selected(&self, items: &[String]) -> Option<usize> {
+        match self.config.device_match.as_deref() {
+            None => Some(0),
+            Some(saved) => {
+                let auto_desc =
+                    devices::auto_select(&self.detected_devices).map(|d| d.description.as_str());
+                if auto_desc == Some(saved) {
+                    return Some(0);
+                }
+                items
+                    .iter()
+                    .position(|s| s == saved || s == &format!("{saved} (disconnected)"))
+            }
+        }
+    }
+
+    /// Build the device-selector section of the popup: a `Device` label
+    /// over a dropdown, or a status caption while detection is pending or
+    /// no AIO is connected.
+    fn device_dropdown_section<'a>(&'a self) -> Element<'a, Message> {
+        if self.detected_devices.is_empty() && self.config.device_match.is_none() {
+            let caption = if self.device_scan_in_flight {
+                "Detecting devices…"
+            } else {
+                "No supported AIO detected"
+            };
+            return column![widget::text::body("Device"), widget::text::caption(caption)]
+                .spacing(4)
+                .into();
+        }
+
+        let items = self.device_dropdown_items();
+        let selected = self.device_dropdown_selected(&items);
+        // The dropdown's `on_selected` closure must be 'static + Send + Sync,
+        // so it cannot borrow `items`. Clone the list into the closure and
+        // index it there to recover the chosen description.
+        let items_for_closure = items.clone();
+        let dropdown = cosmic::widget::dropdown(items, selected, move |idx: usize| -> Message {
+            let choice = if idx == 0 {
+                None
+            } else {
+                items_for_closure
+                    .get(idx)
+                    .map(|s| s.strip_suffix(" (disconnected)").unwrap_or(s).to_string())
+            };
+            Message::DeviceSelected(choice)
+        });
+
+        column![widget::text::body("Device"), dropdown]
             .spacing(4)
             .into()
     }
@@ -717,11 +904,293 @@ mod tests {
         let mut model = AppModel::default();
         let new_cfg = Config {
             sample_interval_ms: 5000,
+            device_match: None,
         };
         let _ = model.update(Message::UpdateConfig(new_cfg));
         assert_eq!(model.config.sample_interval_ms, 5000);
+        assert_eq!(model.config.device_match, None);
         assert!(model.last_status.is_none());
         assert!(model.last_error.is_none());
         assert!(model.temp_history.is_empty());
+    }
+
+    fn detected(description: &str) -> DetectedDevice {
+        DetectedDevice {
+            description: description.to_string(),
+            bus: "hid".to_string(),
+            address: "/dev/hidraw0".to_string(),
+        }
+    }
+
+    #[test]
+    fn update_config_preserves_device_match_when_replaced() {
+        let mut model = AppModel::default();
+        let new_cfg = Config {
+            sample_interval_ms: 2000,
+            device_match: Some("Corsair Hydro H150i Pro XT".to_string()),
+        };
+        let _ = model.update(Message::UpdateConfig(new_cfg));
+        assert_eq!(
+            model.config.device_match.as_deref(),
+            Some("Corsair Hydro H150i Pro XT"),
+        );
+        assert_eq!(model.config.sample_interval_ms, 2000);
+    }
+
+    #[test]
+    fn device_selected_some_persists_choice() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::DeviceSelected(Some(
+            "Corsair Hydro H150i Pro XT".to_string(),
+        )));
+        assert_eq!(
+            model.config.device_match.as_deref(),
+            Some("Corsair Hydro H150i Pro XT"),
+        );
+    }
+
+    #[test]
+    fn device_selected_none_clears_choice() {
+        let mut model = AppModel::default();
+        model.config.device_match = Some("Corsair Hydro H150i Pro XT".to_string());
+        let _ = model.update(Message::DeviceSelected(None));
+        assert_eq!(model.config.device_match, None);
+    }
+
+    #[test]
+    fn device_selected_same_value_is_noop() {
+        let mut model = AppModel::default();
+        model.config.device_match = Some("Corsair Hydro X".to_string());
+        // Seed history so we can prove it survived (no reset on no-op).
+        push_capped(&mut model.temp_history, 30.0);
+        let _ = model.update(Message::DeviceSelected(Some("Corsair Hydro X".to_string())));
+        assert_eq!(
+            model.config.device_match.as_deref(),
+            Some("Corsair Hydro X"),
+        );
+        assert_eq!(model.temp_history.len(), 1);
+    }
+
+    #[test]
+    fn device_selected_change_resets_history() {
+        let mut model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo"), detected("Corsair iCUE Hbar")],
+            ..AppModel::default()
+        };
+        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        assert_eq!(model.temp_history.len(), 1);
+        assert!(model.last_status.is_some());
+
+        let _ = model.update(Message::DeviceSelected(Some(
+            "Corsair iCUE Hbar".to_string(),
+        )));
+
+        assert!(model.temp_history.is_empty());
+        assert!(model.pump_duty_history.is_empty());
+        assert!(model.fan_avg_duty_history.is_empty());
+        assert!(model.last_status.is_none());
+    }
+
+    #[test]
+    fn device_selected_to_auto_when_auto_resolves_to_same_does_not_reset() {
+        // Auto picks "Corsair Hydro Foo" because it's the first AIO.
+        let mut model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        assert_eq!(model.temp_history.len(), 1);
+
+        // Explicitly pick the same description that auto would resolve to —
+        // the effective match is unchanged so histories must survive.
+        let _ = model.update(Message::DeviceSelected(Some(
+            "Corsair Hydro Foo".to_string(),
+        )));
+
+        assert_eq!(model.temp_history.len(), 1);
+        assert!(model.last_status.is_some());
+    }
+
+    #[test]
+    fn devices_enumerated_ok_replaces_list() {
+        let mut model = AppModel {
+            device_scan_in_flight: true,
+            ..AppModel::default()
+        };
+        let _ = model.update(Message::DevicesEnumerated(Ok(vec![
+            detected("Corsair Hydro Foo"),
+            detected("Some RGB Hub"),
+        ])));
+        assert_eq!(model.detected_devices.len(), 2);
+        assert!(!model.device_scan_in_flight);
+    }
+
+    #[test]
+    fn devices_enumerated_change_in_auto_resets_history() {
+        let mut model = AppModel::default();
+        // Seed histories as if a previous device had been polling.
+        push_capped(&mut model.temp_history, 30.0);
+        push_capped(&mut model.pump_duty_history, 70.0);
+        push_capped(&mut model.fan_avg_duty_history, 50.0);
+        model.last_status = Some(sample_status(30.0));
+
+        // Now an enumerate completes and auto-detect picks an AIO where
+        // none was selected before — effective match transitions
+        // None → Some, so histories must clear.
+        let _ = model.update(Message::DevicesEnumerated(Ok(vec![detected(
+            "Corsair Hydro Foo",
+        )])));
+
+        assert!(model.temp_history.is_empty());
+        assert!(model.pump_duty_history.is_empty());
+        assert!(model.fan_avg_duty_history.is_empty());
+        assert!(model.last_status.is_none());
+    }
+
+    #[test]
+    fn devices_enumerated_no_aio_sets_error() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::DevicesEnumerated(Ok(vec![])));
+        assert!(model.last_error.is_some());
+        assert!(
+            model
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("no supported AIO detected"),
+        );
+    }
+
+    #[test]
+    fn devices_enumerated_err_sets_error_preserves_status() {
+        let mut model = AppModel::default();
+        // Drive a successful StatusTick first to populate last_status.
+        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        assert!(model.last_status.is_some());
+
+        let _ = model.update(Message::DevicesEnumerated(Err("boom".to_string())));
+
+        assert_eq!(model.last_error.as_deref(), Some("boom"));
+        assert!(model.last_status.is_some());
+        assert!(!model.device_scan_in_flight);
+    }
+
+    #[test]
+    fn effective_match_prefers_user_choice_over_auto() {
+        let mut model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        model.config.device_match = Some("Corsair iCUE Hbar".to_string());
+        assert_eq!(
+            model.effective_match().as_deref(),
+            Some("Corsair iCUE Hbar"),
+        );
+    }
+
+    #[test]
+    fn effective_match_falls_back_to_auto_when_unset() {
+        let model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        assert_eq!(
+            model.effective_match().as_deref(),
+            Some("Corsair Hydro Foo"),
+        );
+    }
+
+    #[test]
+    fn effective_match_is_none_when_no_aio_detected() {
+        let model = AppModel::default();
+        assert!(model.effective_match().is_none());
+    }
+
+    #[test]
+    fn effective_match_honors_saved_when_disconnected() {
+        let mut model = AppModel::default();
+        // No detected devices, but a saved choice. effective_match must
+        // still return Some so the poll subscription keeps trying.
+        model.config.device_match = Some("Corsair Hydro Lost".to_string());
+        assert_eq!(
+            model.effective_match().as_deref(),
+            Some("Corsair Hydro Lost"),
+        );
+    }
+
+    #[test]
+    fn dropdown_items_includes_auto_first() {
+        let model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        let items = model.device_dropdown_items();
+        assert!(!items.is_empty());
+        assert!(
+            items[0].starts_with("Auto"),
+            "first item should be Auto, got {:?}",
+            items[0],
+        );
+    }
+
+    #[test]
+    fn dropdown_items_appends_disconnected_synthetic_when_saved_missing() {
+        let mut model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        model.config.device_match = Some("Corsair iCUE Hbar".to_string());
+        let items = model.device_dropdown_items();
+        assert!(
+            items
+                .iter()
+                .any(|s| s == "Corsair iCUE Hbar (disconnected)"),
+            "expected disconnected synthetic in {items:?}",
+        );
+    }
+
+    #[test]
+    fn dropdown_items_omits_synthetic_when_saved_is_connected() {
+        let mut model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        model.config.device_match = Some("Corsair Hydro Foo".to_string());
+        let items = model.device_dropdown_items();
+        assert!(
+            !items.iter().any(|s| s.ends_with("(disconnected)")),
+            "no disconnected row when saved is connected, got {items:?}",
+        );
+    }
+
+    #[test]
+    fn dropdown_items_omits_auto_picked_device_from_explicit_list() {
+        // Auto label already names the auto-picked device — listing it
+        // again as its own row would be redundant.
+        let model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo")],
+            ..AppModel::default()
+        };
+        let items = model.device_dropdown_items();
+        assert_eq!(
+            items.len(),
+            1,
+            "single AIO should yield one item (the Auto row only), got {items:?}",
+        );
+        assert!(items[0].starts_with("Auto ("));
+    }
+
+    #[test]
+    fn dropdown_items_lists_non_auto_aios_explicitly() {
+        // With multiple AIOs, only the auto-pick is hidden — the others
+        // remain available as explicit rows.
+        let model = AppModel {
+            detected_devices: vec![detected("Corsair Hydro Foo"), detected("Corsair iCUE Hbar")],
+            ..AppModel::default()
+        };
+        let items = model.device_dropdown_items();
+        assert_eq!(items.len(), 2, "got {items:?}");
+        assert!(items[0].starts_with("Auto (Corsair Hydro Foo)"));
+        assert_eq!(items[1], "Corsair iCUE Hbar");
     }
 }
