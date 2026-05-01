@@ -8,6 +8,7 @@
 
 use cosmic::Theme;
 use cosmic::iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use cosmic::iced::widget::canvas::gradient::Linear;
 use cosmic::iced::{Color, Point, Rectangle, Renderer, mouse};
 
 /// Smallest y-axis span the sparkline will ever use, in the same units as
@@ -17,13 +18,21 @@ const MIN_Y_SPAN: f64 = 2.0;
 
 pub struct Sparkline {
     samples: Vec<f64>,
+    stroke_alpha: f32,
 }
 
 impl Sparkline {
     pub fn new(samples: impl IntoIterator<Item = f64>) -> Self {
         Self {
             samples: samples.into_iter().collect(),
+            stroke_alpha: 0.95,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_stroke_alpha(mut self, alpha: f32) -> Self {
+        self.stroke_alpha = alpha;
+        self
     }
 }
 
@@ -57,6 +66,19 @@ fn y_range(samples: &[f64]) -> (f64, f64) {
     }
 }
 
+/// Build a vertical linear gradient (top = opaque accent, bottom = transparent)
+/// that spans the full frame height.
+fn area_gradient(accent: Color, bounds: Rectangle) -> Linear {
+    let top = Color { a: 0.55, ..accent };
+    let bottom = Color { a: 0.0, ..accent };
+    Linear::new(
+        Point::new(0.0, 0.0),
+        Point::new(0.0, bounds.height),
+    )
+    .add_stop(0.0, top)
+    .add_stop(1.0, bottom)
+}
+
 impl<Message> canvas::Program<Message, Theme> for Sparkline {
     type State = ();
 
@@ -64,7 +86,7 @@ impl<Message> canvas::Program<Message, Theme> for Sparkline {
         &self,
         _state: &Self::State,
         renderer: &Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
@@ -81,30 +103,68 @@ impl<Message> canvas::Program<Message, Theme> for Sparkline {
         let (y_min, y_max) = y_range(&self.samples);
         let range = y_max - y_min;
 
-        let stroke_color = Color::from_rgba8(180, 200, 230, 0.85);
+        let srgba = theme.cosmic().accent.base;
+        let accent = Color {
+            r: srgba.red,
+            g: srgba.green,
+            b: srgba.blue,
+            a: self.stroke_alpha,
+        };
+        let stroke_color = accent;
         let stroke = Stroke::default().with_color(stroke_color).with_width(1.5);
+        let gradient = area_gradient(accent, bounds);
 
-        // Single-sample case: draw a horizontal tick at the sample's y so the
+        // Single-sample case: draw a filled rectangle under the tick so the
         // sparkline is visible immediately after the first poll, instead of
         // waiting for a second reading.
         if self.samples.len() == 1 {
+            #[allow(clippy::cast_possible_truncation)]
             let norm = ((self.samples[0] - y_min) / range) as f32;
-            let y = pad + (1.0 - norm) * usable_h;
-            let path = Path::new(|p| {
-                p.move_to(Point::new(pad, y));
-                p.line_to(Point::new(pad + usable_w, y));
+            let tick_y = pad + (1.0 - norm) * usable_h;
+
+            let area = Path::new(|p| {
+                p.move_to(Point::new(pad, tick_y));
+                p.line_to(Point::new(pad + usable_w, tick_y));
+                p.line_to(Point::new(pad + usable_w, pad + usable_h));
+                p.line_to(Point::new(pad, pad + usable_h));
+                p.close();
             });
-            frame.stroke(&path, stroke);
+            frame.fill(&area, gradient);
+
+            let tick = Path::new(|p| {
+                p.move_to(Point::new(pad, tick_y));
+                p.line_to(Point::new(pad + usable_w, tick_y));
+            });
+            frame.stroke(&tick, stroke);
             return vec![frame.into_geometry()];
         }
 
         let n = self.samples.len();
-        let path = Path::new(|p| {
-            for (i, s) in self.samples.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let points: Vec<Point> = self
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
                 let x = pad + (i as f32 / (n - 1) as f32) * usable_w;
                 let norm = ((s - y_min) / range) as f32;
                 let y = pad + (1.0 - norm) * usable_h;
-                let pt = Point::new(x, y);
+                Point::new(x, y)
+            })
+            .collect();
+
+        // Area path: baseline-left → polyline points → baseline-right → close.
+        let area = Path::new(|p| {
+            p.move_to(Point::new(pad, pad + usable_h));
+            for &pt in &points {
+                p.line_to(pt);
+            }
+            p.line_to(Point::new(pad + usable_w, pad + usable_h));
+            p.close();
+        });
+
+        let polyline = Path::new(|p| {
+            for (i, &pt) in points.iter().enumerate() {
                 if i == 0 {
                     p.move_to(pt);
                 } else {
@@ -113,7 +173,9 @@ impl<Message> canvas::Program<Message, Theme> for Sparkline {
             }
         });
 
-        frame.stroke(&path, stroke);
+        // Fill first so the stroke sits on top.
+        frame.fill(&area, gradient);
+        frame.stroke(&polyline, stroke);
         vec![frame.into_geometry()]
     }
 }
@@ -168,5 +230,11 @@ mod tests {
         let (min, max) = y_range(&[8.0, 9.0, 55.0]);
         assert!(approx(min, 8.0));
         assert!(approx(max, 55.0));
+    }
+
+    #[test]
+    fn with_stroke_alpha_overrides_default() {
+        let s = Sparkline::new([1.0, 2.0]).with_stroke_alpha(0.5);
+        assert!((s.stroke_alpha - 0.5).abs() < 1e-9);
     }
 }
