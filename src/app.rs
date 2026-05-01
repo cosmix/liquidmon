@@ -6,7 +6,7 @@ use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::widget::canvas::Canvas;
-use cosmic::iced::widget::row;
+use cosmic::iced::widget::{column, row};
 use cosmic::iced::{Alignment, Length, Limits, Subscription, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
@@ -18,7 +18,11 @@ use std::time::Duration;
 
 static AUTOSIZE_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("liquidmon-applet"));
 
-const MAX_SAMPLES: usize = 60;
+const PANEL_SPARK_SAMPLES: usize = 60;
+const HISTORY_CAP: usize = 900;
+const MIN_INTERVAL_MS: u64 = 1000;
+const MAX_INTERVAL_MS: u64 = 10000;
+
 const ICON_TEMP: &[u8] = include_bytes!("../resources/icons/temperature-symbolic.svg");
 const ICON_SNOWFLAKE: &[u8] = include_bytes!("../resources/icons/snowflake-symbolic.svg");
 const ICON_FAN: &[u8] = include_bytes!("../resources/icons/fan-symbolic.svg");
@@ -38,6 +42,45 @@ fn fan_duty_avg(fans: &[crate::liquidctl::Fan]) -> Option<u8> {
     Some((sum / fans.len() as u32) as u8)
 }
 
+fn fan_speed_avg(fans: &[crate::liquidctl::Fan]) -> Option<u32> {
+    if fans.is_empty() {
+        return None;
+    }
+    let sum: u64 = fans.iter().map(|f| u64::from(f.speed_rpm)).sum();
+    Some((sum / fans.len() as u64) as u32)
+}
+
+/// Push a new sample onto a metric history, evicting from the front to keep
+/// the buffer bounded at `HISTORY_CAP`.
+fn push_capped(buf: &mut VecDeque<f64>, value: f64) {
+    buf.push_back(value);
+    while buf.len() > HISTORY_CAP {
+        buf.pop_front();
+    }
+}
+
+/// Build one popup metric section: caption label, sparkline canvas, numeric
+/// body. Extracted so `view_window` stays under the file's 50-line per-fn
+/// soft limit.
+fn metric_section<'a>(
+    label: &'a str,
+    history: &VecDeque<f64>,
+    height: f32,
+    value_text: String,
+) -> Element<'a, Message> {
+    let sparkline = Canvas::new(Sparkline::new(history.iter().copied()))
+        .width(Length::Fixed(320.0))
+        .height(Length::Fixed(height));
+
+    column![
+        widget::text::caption(label),
+        sparkline,
+        widget::text::body(value_text).font(cosmic::font::mono()),
+    ]
+    .spacing(4)
+    .into()
+}
+
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
 #[derive(Default)]
@@ -48,12 +91,25 @@ pub struct AppModel {
     popup: Option<Id>,
     /// Configuration data that persists between application runs.
     config: Config,
+    /// Live cosmic-config handle held so `write_entry` can persist updates
+    /// initiated from the popup slider. `None` if the config service was
+    /// unavailable at startup.
+    config_handle: Option<cosmic_config::Config>,
+    /// Slider value while the user is mid-drag, in seconds. `None` outside a
+    /// drag — release commits this into `config.sample_interval_ms` so the
+    /// subscription key stays stable during the drag.
+    pending_interval_secs: Option<f32>,
     /// The most recent successful liquidctl status reading.
     last_status: Option<crate::liquidctl::AioStatus>,
     /// The most recent error message, if any.
     last_error: Option<String>,
-    /// Liquid temperature samples for the panel sparkline (oldest first).
+    /// Liquid temperature samples (oldest first).
     temp_history: VecDeque<f64>,
+    /// Pump duty samples in percent (oldest first).
+    pump_duty_history: VecDeque<f64>,
+    /// Mean fan duty across all fans, in percent (oldest first). Skipped on
+    /// ticks with no fans so the y-axis auto-scaler isn't dragged toward zero.
+    fan_avg_duty_history: VecDeque<f64>,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -63,6 +119,10 @@ pub enum Message {
     PopupClosed(Id),
     UpdateConfig(Config),
     StatusTick(Result<crate::liquidctl::AioStatus, String>),
+    /// Fired continuously while the user drags the sample-interval slider.
+    SampleIntervalDragged(f32),
+    /// Fired once when the slider is released — commits and persists.
+    SampleIntervalReleased,
 }
 
 /// Create a COSMIC application from the app model
@@ -92,15 +152,21 @@ impl cosmic::Application for AppModel {
         core: cosmic::Core,
         _flags: Self::Flags,
     ) -> (Self, Task<cosmic::Action<Self::Message>>) {
-        // Construct the app model with the runtime's core.
+        // Build the handle once and reuse for both reading the entry and
+        // (later) persisting writes from the slider.
+        let config_handle = cosmic_config::Config::new(Self::APP_ID, Config::VERSION).ok();
+        let config = config_handle
+            .as_ref()
+            .map(|ctx| match Config::get_entry(ctx) {
+                Ok(c) => c,
+                Err((_errors, c)) => c,
+            })
+            .unwrap_or_default();
+
         let app = AppModel {
             core,
-            config: cosmic_config::Config::new(Self::APP_ID, Config::VERSION)
-                .map(|context| match Config::get_entry(&context) {
-                    Ok(config) => config,
-                    Err((_errors, config)) => config,
-                })
-                .unwrap_or_default(),
+            config,
+            config_handle,
             ..Default::default()
         };
 
@@ -126,7 +192,15 @@ impl cosmic::Application for AppModel {
                 };
                 let pump_text = format!("{}%", status.pump.duty_pct);
 
-                let sparkline = Canvas::new(Sparkline::new(self.temp_history.iter().copied()))
+                // Feed only the most recent PANEL_SPARK_SAMPLES so the panel
+                // glyph stays a short-window trend even though we keep a much
+                // longer history for the popup.
+                let panel_iter = self
+                    .temp_history
+                    .iter()
+                    .copied()
+                    .skip(self.temp_history.len().saturating_sub(PANEL_SPARK_SAMPLES));
+                let sparkline = Canvas::new(Sparkline::new(panel_iter))
                     .width(Length::Fixed(36.0))
                     .height(Length::Fixed(16.0));
 
@@ -165,49 +239,14 @@ impl cosmic::Application for AppModel {
     /// create a view for.
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
         let content: Element<'_, Self::Message> = match (&self.last_status, &self.last_error) {
-            (Some(status), maybe_err) => {
-                let mut column = widget::list_column();
-
-                column = column.add(widget::text::heading(status.description.clone()));
-                column = column.add(
-                    widget::text::body(format!("Liquid: {:.1} °C", status.liquid_temp_c))
-                        .font(cosmic::font::mono()),
-                );
-                column = column.add(
-                    widget::text::body(format!(
-                        "Pump   {} rpm   {}%",
-                        status.pump.speed_rpm, status.pump.duty_pct
-                    ))
-                    .font(cosmic::font::mono()),
-                );
-
-                for fan in &status.fans {
-                    column = column.add(
-                        widget::text::body(format!(
-                            "Fan {}  {} rpm   {}%",
-                            fan.index, fan.speed_rpm, fan.duty_pct
-                        ))
-                        .font(cosmic::font::mono()),
-                    );
-                }
-
-                if let Some(err) = maybe_err {
-                    column = column.add(widget::text::caption(format!("error: {err}")));
-                }
-
-                column.into()
-            }
-            (None, Some(err)) => {
-                let column = widget::list_column()
-                    .add(widget::text::heading("liquidctl error".to_string()))
-                    .add(widget::text::body(err.clone()));
-                column.into()
-            }
-            (None, None) => {
-                let column = widget::list_column()
-                    .add(widget::text::body("Waiting for first reading…".to_string()));
-                column.into()
-            }
+            (Some(status), maybe_err) => self.popup_metrics_view(status, maybe_err.as_deref()),
+            (None, Some(err)) => widget::list_column()
+                .add(widget::text::heading("liquidctl error".to_string()))
+                .add(widget::text::body(err.clone()))
+                .into(),
+            (None, None) => widget::list_column()
+                .add(widget::text::body("Waiting for first reading…".to_string()))
+                .into(),
         };
 
         self.core.applet.popup_container(content).into()
@@ -220,23 +259,34 @@ impl cosmic::Application for AppModel {
     /// activated by selectively appending to the subscription batch, and will
     /// continue to execute for the duration that they remain in the batch.
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::batch(vec![
-            // Poll liquidctl for status every 1500ms.
-            Subscription::run_with("liquidctl-sub", |_| {
-                cosmic::iced::stream::channel(4, |mut channel: mpsc::Sender<Message>| async move {
-                    loop {
-                        let result = crate::liquidctl::fetch_status("Hydro")
-                            .await
-                            .map_err(|e| format!("{e}"));
-                        if channel.send(Message::StatusTick(result)).await.is_err() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Subscription identity is the (data, fn-pointer) pair: keying on the
+        // interval means iced tears down and restarts the poll loop only when
+        // the user commits a new interval (drag-release), not on every drag
+        // tick. `run_with` requires a real fn pointer, so we cannot capture —
+        // the interval rides through as `data`.
+        let interval_ms = self
+            .config
+            .sample_interval_ms
+            .clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS);
+
+        let liquidctl_sub = Subscription::run_with(interval_ms, |interval_ms: &u64| {
+            let interval_ms = *interval_ms;
+            cosmic::iced::stream::channel(4, move |mut channel: mpsc::Sender<Message>| async move {
+                loop {
+                    let result = crate::liquidctl::fetch_status("Hydro")
+                        .await
+                        .map_err(|e| format!("{e}"));
+                    if channel.send(Message::StatusTick(result)).await.is_err() {
+                        break;
                     }
-                    futures_util::future::pending().await
-                })
-            }),
-            // Watch for application configuration changes.
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                }
+                futures_util::future::pending().await
+            })
+        });
+
+        Subscription::batch(vec![
+            liquidctl_sub,
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
                 .map(|update| Message::UpdateConfig(update.config)),
@@ -254,16 +304,26 @@ impl cosmic::Application for AppModel {
                 self.config = config;
             }
             Message::StatusTick(Ok(status)) => {
-                self.temp_history.push_back(status.liquid_temp_c);
-                while self.temp_history.len() > MAX_SAMPLES {
-                    self.temp_history.pop_front();
+                push_capped(&mut self.temp_history, status.liquid_temp_c);
+                push_capped(&mut self.pump_duty_history, f64::from(status.pump.duty_pct));
+                // Skip the push entirely when no fans are reported — pushing
+                // 0.0 would corrupt the auto-scaled y-axis on the next tick.
+                if let Some(pct) = fan_duty_avg(&status.fans) {
+                    push_capped(&mut self.fan_avg_duty_history, f64::from(pct));
                 }
+
                 self.last_status = Some(status);
                 self.last_error = None;
             }
             Message::StatusTick(Err(msg)) => {
                 self.last_error = Some(msg);
                 // Intentionally don't clear last_status — show stale data alongside the error.
+            }
+            Message::SampleIntervalDragged(secs) => {
+                self.pending_interval_secs = Some(secs);
+            }
+            Message::SampleIntervalReleased => {
+                self.commit_pending_interval();
             }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
@@ -280,9 +340,9 @@ impl cosmic::Application for AppModel {
                         .applet
                         .get_popup_settings(parent, new_id, None, None, None);
                     popup_settings.positioner.size_limits = Limits::NONE
-                        .max_width(372.0)
-                        .min_width(300.0)
-                        .min_height(200.0)
+                        .max_width(380.0)
+                        .min_width(320.0)
+                        .min_height(360.0)
                         .max_height(1080.0);
                     get_popup(popup_settings)
                 };
@@ -301,6 +361,133 @@ impl cosmic::Application for AppModel {
     }
 }
 
+impl AppModel {
+    /// Render the populated popup body — three metric sections (coolant temp,
+    /// pump duty, fan-average duty), the sample-rate slider, and an optional
+    /// error caption — wrapped in a `scrollable` so constrained panels degrade
+    /// to scroll instead of clipping.
+    fn popup_metrics_view<'a>(
+        &'a self,
+        status: &'a crate::liquidctl::AioStatus,
+        maybe_err: Option<&'a str>,
+    ) -> Element<'a, Message> {
+        let pump_text = format!("{} rpm   {} %", status.pump.speed_rpm, status.pump.duty_pct);
+        let fan_text = match (fan_speed_avg(&status.fans), fan_duty_avg(&status.fans)) {
+            (Some(rpm), Some(pct)) => format!("{rpm} rpm   {pct} %"),
+            _ => "—".to_string(),
+        };
+
+        // Live drag value falls back to the persisted setting when not dragging.
+        // The slider itself is f32; the persisted value is u64 ms — the cast is
+        // narrowing only above ~16 million ms which we clamp far below.
+        #[allow(clippy::cast_precision_loss)]
+        let secs = self
+            .pending_interval_secs
+            .unwrap_or((self.config.sample_interval_ms as f32) / 1000.0);
+
+        let slider = widget::slider(1.0..=10.0_f32, secs, Message::SampleIntervalDragged)
+            .step(0.5_f32)
+            .on_release(Message::SampleIntervalReleased)
+            .width(Length::Fill);
+
+        let mut sections: Vec<Element<'a, Message>> = Vec::with_capacity(6);
+        sections.push(widget::text::heading(status.description.clone()).into());
+        sections.push(metric_section(
+            "Coolant temperature",
+            &self.temp_history,
+            80.0,
+            format!("{:.1} °C", status.liquid_temp_c),
+        ));
+        sections.push(metric_section(
+            "Pump",
+            &self.pump_duty_history,
+            80.0,
+            pump_text,
+        ));
+        sections.push(self.fans_section(status, fan_text));
+        sections.push(
+            column![
+                widget::text::body(format!("Sample interval: {secs:.1} s")),
+                slider,
+            ]
+            .spacing(4)
+            .into(),
+        );
+        if let Some(err) = maybe_err {
+            sections.push(widget::text::caption(format!("error: {err}")).into());
+        }
+
+        widget::scrollable(
+            cosmic::iced::widget::Column::with_children(sections)
+                .spacing(12)
+                .padding(12),
+        )
+        .into()
+    }
+
+    /// Fans section: average duty sparkline + average rpm/duty body, plus a
+    /// compact per-fan rpm/duty line so non-uniform fans stay visible at a
+    /// glance. Falls back to the bare avg row when the device reports no fans.
+    fn fans_section<'a>(
+        &'a self,
+        status: &'a crate::liquidctl::AioStatus,
+        avg_text: String,
+    ) -> Element<'a, Message> {
+        let sparkline = Canvas::new(Sparkline::new(self.fan_avg_duty_history.iter().copied()))
+            .width(Length::Fixed(320.0))
+            .height(Length::Fixed(80.0));
+
+        let mut children: Vec<Element<'a, Message>> = vec![
+            widget::text::caption("Fans (avg)").into(),
+            sparkline.into(),
+            widget::text::body(avg_text)
+                .font(cosmic::font::mono())
+                .into(),
+        ];
+
+        if !status.fans.is_empty() {
+            let per_fan = status
+                .fans
+                .iter()
+                .map(|f| format!("{} {}rpm/{}%", f.index, f.speed_rpm, f.duty_pct))
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            children.push(
+                widget::text::caption(per_fan)
+                    .font(cosmic::font::mono())
+                    .into(),
+            );
+        }
+
+        cosmic::iced::widget::Column::with_children(children)
+            .spacing(4)
+            .into()
+    }
+
+    /// Apply the staged slider value, clamp to the supported range, and persist
+    /// to cosmic-config (best effort). No-op when no drag is in progress.
+    fn commit_pending_interval(&mut self) {
+        let Some(secs) = self.pending_interval_secs.take() else {
+            return;
+        };
+        // Clamp the f64 ms value first — the slider range is [1.0, 10.0] so
+        // (secs * 1000.0) sits in [1000, 10000] far below u64::MAX, and the
+        // clamp below pulls anything else into bounds before we cast.
+        #[allow(clippy::cast_precision_loss)]
+        let (lo, hi) = (MIN_INTERVAL_MS as f64, MAX_INTERVAL_MS as f64);
+        let ms_f = (f64::from(secs) * 1000.0).round().clamp(lo, hi);
+        // Cast is safe: ms_f ∈ [1000, 10000] ⊂ u64.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ms = ms_f as u64;
+        if ms != self.config.sample_interval_ms {
+            self.config.sample_interval_ms = ms;
+            if let Some(handle) = self.config_handle.as_ref() {
+                let _ = self.config.write_entry(handle);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +499,14 @@ mod tests {
             index,
             speed_rpm: 1000,
             duty_pct,
+        }
+    }
+
+    fn fan_with_speed(index: u8, speed_rpm: u32) -> Fan {
+        Fan {
+            index,
+            speed_rpm,
+            duty_pct: 50,
         }
     }
 
@@ -355,6 +550,19 @@ mod tests {
     }
 
     #[test]
+    fn fan_speed_avg_computes_integer_mean() {
+        assert_eq!(
+            fan_speed_avg(&[
+                fan_with_speed(1, 1000),
+                fan_with_speed(2, 2000),
+                fan_with_speed(3, 3000),
+            ]),
+            Some(2000)
+        );
+        assert_eq!(fan_speed_avg(&[]), None);
+    }
+
+    #[test]
     fn status_tick_ok_appends_temp_and_clears_error() {
         let mut model = AppModel {
             last_error: Some("previous error".to_string()),
@@ -378,19 +586,19 @@ mod tests {
 
         let _ = model.update(Message::StatusTick(Err("boom".to_string())));
 
-        // Stale data preserved per src/app.rs:268-275 design comment.
+        // Stale data preserved: error is shown alongside the last good reading.
         assert!(model.last_status.is_some());
         assert_eq!(model.last_error.as_deref(), Some("boom"));
         assert_eq!(model.temp_history.len(), 1);
     }
 
     #[test]
-    fn temp_history_caps_at_max_samples() {
+    fn temp_history_caps_at_history_cap() {
         let mut model = AppModel::default();
-        for i in 0..(MAX_SAMPLES + 10) {
+        for i in 0..(HISTORY_CAP + 10) {
             let _ = model.update(Message::StatusTick(Ok(sample_status(20.0 + i as f64))));
         }
-        assert_eq!(model.temp_history.len(), MAX_SAMPLES);
+        assert_eq!(model.temp_history.len(), HISTORY_CAP);
         // Oldest sample dropped: first retained value should be index 10 (=> 30.0).
         let first = *model.temp_history.front().unwrap();
         assert!(
@@ -399,8 +607,78 @@ mod tests {
         );
         // Newest is the last one pushed.
         let last = *model.temp_history.back().unwrap();
-        let expected_last = 20.0 + (MAX_SAMPLES + 10 - 1) as f64;
+        let expected_last = 20.0 + (HISTORY_CAP + 10 - 1) as f64;
         assert!((last - expected_last).abs() < 1e-9);
+    }
+
+    #[test]
+    fn status_tick_ok_appends_to_all_metric_histories() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+
+        assert_eq!(model.temp_history.len(), 1);
+        assert_eq!(model.pump_duty_history.len(), 1);
+        // sample_status has 3 fans → fan-avg-duty history should grow.
+        assert_eq!(model.fan_avg_duty_history.len(), 1);
+
+        // Fan averages: duty 40+50+60 → 50.
+        assert!((model.fan_avg_duty_history[0] - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn status_tick_with_no_fans_skips_fan_history_push() {
+        let mut model = AppModel::default();
+        let mut status = sample_status(28.0);
+        status.fans.clear();
+        let _ = model.update(Message::StatusTick(Ok(status)));
+
+        assert_eq!(model.temp_history.len(), 1);
+        assert_eq!(model.pump_duty_history.len(), 1);
+        assert!(model.fan_avg_duty_history.is_empty());
+    }
+
+    #[test]
+    fn sample_interval_dragged_stages_pending_value() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::SampleIntervalDragged(2.5));
+        assert_eq!(model.pending_interval_secs, Some(2.5));
+        // Dragging alone must NOT mutate persisted config — keeps the
+        // subscription identity stable during the drag.
+        assert_eq!(model.config.sample_interval_ms, 1500);
+    }
+
+    #[test]
+    fn sample_interval_released_commits_clamped_value() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::SampleIntervalDragged(3.0));
+        let _ = model.update(Message::SampleIntervalReleased);
+        assert_eq!(model.config.sample_interval_ms, 3000);
+        assert_eq!(model.pending_interval_secs, None);
+    }
+
+    #[test]
+    fn sample_interval_released_clamps_above_max() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::SampleIntervalDragged(99.0));
+        let _ = model.update(Message::SampleIntervalReleased);
+        assert_eq!(model.config.sample_interval_ms, MAX_INTERVAL_MS);
+    }
+
+    #[test]
+    fn sample_interval_released_clamps_below_min() {
+        let mut model = AppModel::default();
+        let _ = model.update(Message::SampleIntervalDragged(0.1));
+        let _ = model.update(Message::SampleIntervalReleased);
+        assert_eq!(model.config.sample_interval_ms, MIN_INTERVAL_MS);
+    }
+
+    #[test]
+    fn sample_interval_released_without_drag_is_noop() {
+        let mut model = AppModel::default();
+        let original = model.config.sample_interval_ms;
+        let _ = model.update(Message::SampleIntervalReleased);
+        assert_eq!(model.config.sample_interval_ms, original);
+        assert_eq!(model.pending_interval_secs, None);
     }
 
     #[test]
@@ -429,9 +707,11 @@ mod tests {
     #[test]
     fn update_config_replaces_config() {
         let mut model = AppModel::default();
-        let new_cfg = Config::default();
+        let new_cfg = Config {
+            sample_interval_ms: 5000,
+        };
         let _ = model.update(Message::UpdateConfig(new_cfg));
-        // Config is currently empty; just assert the arm runs and doesn't disturb other state.
+        assert_eq!(model.config.sample_interval_ms, 5000);
         assert!(model.last_status.is_none());
         assert!(model.last_error.is_none());
         assert!(model.temp_history.is_empty());
