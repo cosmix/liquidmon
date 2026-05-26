@@ -5,13 +5,25 @@
   <project_license>MPL-2.0</project_license>
   <name>LiquidMon</name>
   <summary>COSMIC panel applet for AIO liquid cooler temps and fan/pump duties via liquidctl</summary>
+  <description>
+    <p>
+      LiquidMon is a COSMIC panel applet that monitors AIO liquid cooler
+      temperature, fan duty, and pump duty through the liquidctl command-line
+      tool.
+    </p>
+    <p>
+      It shows live readings in the panel and opens a popup with sparklines,
+      per-fan status, device selection, and a configurable sample interval.
+    </p>
+  </description>
+  <developer id="com.github.cosmix">
+    <name>Dimosthenis Kaponis</name>
+  </developer>
+  <url type="homepage">https://github.com/cosmix/liquidmon</url>
   <url type="vcs-browser">https://github.com/cosmix/liquidmon</url>
   <launchable type="desktop-id">com.github.cosmix.LiquidMon.desktop</launchable>
   <provides>
-    <id>com.github.cosmix.LiquidMon</id>
-    <binaries>
-      <binary>liquidmon</binary>
-    </binaries>
+    <binary>liquidmon</binary>
   </provides>
   <requires>
     <display_length compare="ge">360</display_length>
@@ -22,10 +34,15 @@
     <control>touch</control>
   </supports>
   <categories>
-    <category>COSMIC</category>
+    <category>System</category>
+    <category>Monitor</category>
   </categories>
   <keywords>
     <keyword>COSMIC</keyword>
+    <keyword>AIO</keyword>
+    <keyword>liquidctl</keyword>
+    <keyword>cooler</keyword>
+    <keyword>temperature</keyword>
   </keywords>
   <content_rating type="oars-1.1" />
 </component>

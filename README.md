@@ -77,7 +77,7 @@ Build and install:
 cargo build --release
 sudo install -Dm0755 target/release/liquidmon /usr/bin/liquidmon
 sudo install -Dm0644 resources/app.desktop /usr/share/applications/com.github.cosmix.LiquidMon.desktop
-sudo install -Dm0644 resources/app.metainfo.xml /usr/share/appdata/com.github.cosmix.LiquidMon.metainfo.xml
+sudo install -Dm0644 resources/app.metainfo.xml /usr/share/metainfo/com.github.cosmix.LiquidMon.metainfo.xml
 sudo install -Dm0644 resources/icon.svg /usr/share/icons/hicolor/scalable/apps/com.github.cosmix.LiquidMon.svg
 ```
 

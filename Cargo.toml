@@ -22,7 +22,7 @@ configured with appropriate udev rules."""
 assets = [
     ["target/release/liquidmon", "usr/bin/", "755"],
     ["resources/app.desktop", "usr/share/applications/com.github.cosmix.LiquidMon.desktop", "644"],
-    ["resources/app.metainfo.xml", "usr/share/appdata/com.github.cosmix.LiquidMon.metainfo.xml", "644"],
+    ["resources/app.metainfo.xml", "usr/share/metainfo/com.github.cosmix.LiquidMon.metainfo.xml", "644"],
     ["resources/icon.svg", "usr/share/icons/hicolor/scalable/apps/com.github.cosmix.LiquidMon.svg", "644"],
     ["README.md", "usr/share/doc/liquidmon/README", "644"],
 ]
