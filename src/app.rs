@@ -126,7 +126,12 @@ pub enum Message {
     TogglePopup,
     PopupClosed(Id),
     UpdateConfig(Config),
-    StatusTick(Result<crate::liquidctl::AioStatus, String>),
+    /// Result of one status poll, paired with the effective match string that
+    /// created the subscription so late results from old devices can be ignored.
+    StatusTick {
+        match_str: String,
+        result: Result<crate::liquidctl::AioStatus, String>,
+    },
     /// Fired continuously while the user drags the sample-interval slider.
     SampleIntervalDragged(f32),
     /// Fired once when the slider is released — commits and persists.
@@ -313,7 +318,14 @@ impl cosmic::Application for AppModel {
                             let result = crate::liquidctl::fetch_status(&match_str)
                                 .await
                                 .map_err(|e| format!("{e}"));
-                            if channel.send(Message::StatusTick(result)).await.is_err() {
+                            if channel
+                                .send(Message::StatusTick {
+                                    match_str: match_str.clone(),
+                                    result,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
@@ -335,23 +347,36 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         match message {
             Message::UpdateConfig(config) => {
+                let prev_effective = self.effective_match();
                 self.config = config;
+                let new_effective = self.effective_match();
+                if prev_effective != new_effective {
+                    self.reset_device_state();
+                }
             }
-            Message::StatusTick(Ok(status)) => {
-                push_capped(&mut self.temp_history, status.liquid_temp_c);
-                push_capped(&mut self.pump_duty_history, f64::from(status.pump.duty_pct));
-                // Skip the push entirely when no fans are reported — pushing
-                // 0.0 would corrupt the auto-scaled y-axis on the next tick.
-                if let Some(pct) = fan_duty_avg(&status.fans) {
-                    push_capped(&mut self.fan_avg_duty_history, f64::from(pct));
+            Message::StatusTick { match_str, result } => {
+                if self.effective_match().as_deref() != Some(match_str.as_str()) {
+                    return Task::none();
                 }
 
-                self.last_status = Some(status);
-                self.last_error = None;
-            }
-            Message::StatusTick(Err(msg)) => {
-                self.last_error = Some(msg);
-                // Intentionally don't clear last_status — show stale data alongside the error.
+                match result {
+                    Ok(status) => {
+                        push_capped(&mut self.temp_history, status.liquid_temp_c);
+                        push_capped(&mut self.pump_duty_history, f64::from(status.pump.duty_pct));
+                        // Skip the push entirely when no fans are reported — pushing
+                        // 0.0 would corrupt the auto-scaled y-axis on the next tick.
+                        if let Some(pct) = fan_duty_avg(&status.fans) {
+                            push_capped(&mut self.fan_avg_duty_history, f64::from(pct));
+                        }
+
+                        self.last_status = Some(status);
+                        self.last_error = None;
+                    }
+                    Err(msg) => {
+                        self.last_error = Some(msg);
+                        // Intentionally don't clear last_status — show stale data alongside the error.
+                    }
+                }
             }
             Message::SampleIntervalDragged(secs) => {
                 self.pending_interval_secs = Some(secs);
@@ -732,6 +757,25 @@ mod tests {
         }
     }
 
+    const TEST_MATCH: &str = "Corsair Hydro Foo";
+
+    fn matched_model() -> AppModel {
+        AppModel {
+            config: Config {
+                device_match: Some(TEST_MATCH.to_string()),
+                ..Config::default()
+            },
+            ..AppModel::default()
+        }
+    }
+
+    fn status_tick(match_str: &str, result: Result<AioStatus, String>) -> Message {
+        Message::StatusTick {
+            match_str: match_str.to_string(),
+            result,
+        }
+    }
+
     #[test]
     fn fan_duty_avg_is_none_for_empty() {
         assert_eq!(fan_duty_avg(&[]), None);
@@ -775,11 +819,15 @@ mod tests {
     #[test]
     fn status_tick_ok_appends_temp_and_clears_error() {
         let mut model = AppModel {
+            config: Config {
+                device_match: Some(TEST_MATCH.to_string()),
+                ..Config::default()
+            },
             last_error: Some("previous error".to_string()),
             ..AppModel::default()
         };
 
-        let _ = model.update(Message::StatusTick(Ok(sample_status(30.5))));
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.5))));
 
         assert_eq!(model.temp_history.len(), 1);
         assert!((model.temp_history[0] - 30.5).abs() < 1e-9);
@@ -790,11 +838,11 @@ mod tests {
 
     #[test]
     fn status_tick_err_preserves_stale_status() {
-        let mut model = AppModel::default();
-        let _ = model.update(Message::StatusTick(Ok(sample_status(31.0))));
+        let mut model = matched_model();
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(31.0))));
         assert!(model.last_status.is_some());
 
-        let _ = model.update(Message::StatusTick(Err("boom".to_string())));
+        let _ = model.update(status_tick(TEST_MATCH, Err("boom".to_string())));
 
         // Stale data preserved: error is shown alongside the last good reading.
         assert!(model.last_status.is_some());
@@ -804,9 +852,9 @@ mod tests {
 
     #[test]
     fn temp_history_caps_at_history_cap() {
-        let mut model = AppModel::default();
+        let mut model = matched_model();
         for i in 0..(HISTORY_CAP + 10) {
-            let _ = model.update(Message::StatusTick(Ok(sample_status(20.0 + i as f64))));
+            let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(20.0 + i as f64))));
         }
         assert_eq!(model.temp_history.len(), HISTORY_CAP);
         // Oldest sample dropped: first retained value should be index 10 (=> 30.0).
@@ -823,8 +871,8 @@ mod tests {
 
     #[test]
     fn status_tick_ok_appends_to_all_metric_histories() {
-        let mut model = AppModel::default();
-        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        let mut model = matched_model();
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
 
         assert_eq!(model.temp_history.len(), 1);
         assert_eq!(model.pump_duty_history.len(), 1);
@@ -837,14 +885,32 @@ mod tests {
 
     #[test]
     fn status_tick_with_no_fans_skips_fan_history_push() {
-        let mut model = AppModel::default();
+        let mut model = matched_model();
         let mut status = sample_status(28.0);
         status.fans.clear();
-        let _ = model.update(Message::StatusTick(Ok(status)));
+        let _ = model.update(status_tick(TEST_MATCH, Ok(status)));
 
         assert_eq!(model.temp_history.len(), 1);
         assert_eq!(model.pump_duty_history.len(), 1);
         assert!(model.fan_avg_duty_history.is_empty());
+    }
+
+    #[test]
+    fn status_tick_from_stale_match_is_ignored() {
+        let mut model = AppModel {
+            config: Config {
+                device_match: Some("Corsair iCUE Hbar".to_string()),
+                ..Config::default()
+            },
+            last_error: Some("current error".to_string()),
+            ..AppModel::default()
+        };
+
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
+
+        assert!(model.last_status.is_none());
+        assert!(model.temp_history.is_empty());
+        assert_eq!(model.last_error.as_deref(), Some("current error"));
     }
 
     #[test]
@@ -953,6 +1019,43 @@ mod tests {
     }
 
     #[test]
+    fn update_config_device_change_resets_history() {
+        let mut model = matched_model();
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
+        assert_eq!(model.temp_history.len(), 1);
+        assert!(model.last_status.is_some());
+
+        let _ = model.update(Message::UpdateConfig(Config {
+            sample_interval_ms: 2500,
+            device_match: Some("Corsair iCUE Hbar".to_string()),
+        }));
+
+        assert!(model.temp_history.is_empty());
+        assert!(model.pump_duty_history.is_empty());
+        assert!(model.fan_avg_duty_history.is_empty());
+        assert!(model.last_status.is_none());
+        assert_eq!(
+            model.config.device_match.as_deref(),
+            Some("Corsair iCUE Hbar"),
+        );
+    }
+
+    #[test]
+    fn update_config_interval_only_preserves_history() {
+        let mut model = matched_model();
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
+
+        let _ = model.update(Message::UpdateConfig(Config {
+            sample_interval_ms: 2500,
+            device_match: Some(TEST_MATCH.to_string()),
+        }));
+
+        assert_eq!(model.temp_history.len(), 1);
+        assert!(model.last_status.is_some());
+        assert_eq!(model.config.sample_interval_ms, 2500);
+    }
+
+    #[test]
     fn device_selected_some_persists_choice() {
         let mut model = AppModel::default();
         let _ = model.update(Message::DeviceSelected(Some(
@@ -992,7 +1095,7 @@ mod tests {
             detected_devices: vec![detected("Corsair Hydro Foo"), detected("Corsair iCUE Hbar")],
             ..AppModel::default()
         };
-        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
         assert_eq!(model.temp_history.len(), 1);
         assert!(model.last_status.is_some());
 
@@ -1013,7 +1116,7 @@ mod tests {
             detected_devices: vec![detected("Corsair Hydro Foo")],
             ..AppModel::default()
         };
-        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
         assert_eq!(model.temp_history.len(), 1);
 
         // Explicitly pick the same description that auto would resolve to —
@@ -1078,9 +1181,9 @@ mod tests {
 
     #[test]
     fn devices_enumerated_err_sets_error_preserves_status() {
-        let mut model = AppModel::default();
+        let mut model = matched_model();
         // Drive a successful StatusTick first to populate last_status.
-        let _ = model.update(Message::StatusTick(Ok(sample_status(30.0))));
+        let _ = model.update(status_tick(TEST_MATCH, Ok(sample_status(30.0))));
         assert!(model.last_status.is_some());
 
         let _ = model.update(Message::DevicesEnumerated(Err("boom".to_string())));
