@@ -30,11 +30,15 @@ main.rs
   ├── mod devices   (devices.rs)
   ├── mod liquidctl (liquidctl.rs)
   ├── mod sparkline (sparkline.rs)
+  ├── mod equalizer (equalizer.rs)
+  ├── mod spinner   (spinner.rs)
   └── mod app       (app.rs)
         ├── uses crate::config::Config
         ├── uses crate::liquidctl::{AioStatus, DetectedDevice, list_devices, fetch_status}
         ├── uses crate::devices::{filter_aios, auto_select}
-        └── uses crate::sparkline::Sparkline
+        ├── uses crate::sparkline::{Sparkline, SparklineTint}   (panel button only)
+        ├── uses crate::equalizer::Equalizer                    (popup metric blocks)
+        └── uses crate::spinner::{Spinner, Kind}                (popup fan/pump glyphs)
 ```
 
 `main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the only consumer of `config`, `liquidctl`, `devices`, and `sparkline`. The `devices` module depends only on `liquidctl::DetectedDevice`.
@@ -417,3 +421,16 @@ A tagged release produces three artifacts uploaded to GitHub Releases:
 1. `liquidmon_<version>_amd64.deb` — installable Debian package (includes `liquidctl` dep)
 2. `liquidmon-<version>-x86_64-linux.tar.gz` — raw tarball (binary + desktop + icon + metainfo)
 3. `SHA256SUMS` — checksums for both archives
+
+## Popup Visualization Widgets and Spinner Animation (src/equalizer.rs, src/spinner.rs)
+
+The popup metric history is rendered as an 80s graphic-equalizer / VU-meter instead of a smooth sparkline. The panel button still uses `sparkline.rs` (small 36×16 trend glyph); the **popup** uses these two new canvas widgets:
+
+- **`equalizer.rs` — `Equalizer { samples, lo, hi }`**: a `canvas::Program` that bins the sample window into a **fixed** number of columns (`(bounds.width / COL_PITCH=7px).max(1)` — count is anchored to width, NOT sample count, so the bar count stays constant as history accumulates; an earlier `clamp(1, samples.len())` made the column count grow over time, which read as a bug). Each column is a stack of `SEGMENTS=10` LED cells lit bottom-up. **Normalisation is against the caller-supplied absolute range `lo..=hi`, clamped — NOT auto-scaled.** This is load-bearing: an auto-scaled window stretches a 0.2 °C wiggle across the whole meter and paints the tallest bar red, making the VU colour ramp meaningless. Colour follows the classic ramp by absolute height (green < `GREEN_MAX=0.6` of stack, amber < `AMBER_MAX=0.85`, red above); topmost lit cell is a full-intensity "peak cap", lower lit cells alpha 0.82, unlit cells theme `background.on` at alpha 0.10. Ranges are defined in `app.rs`: `TEMP_RANGE=(20.0,55.0)` °C for coolant, `DUTY_RANGE=(0.0,100.0)` % for pump/fan duty (the pump/fan meters plot **duty %**, not rpm — rpm is in the header readout only). Sized `Length::Fill`.
+- **`spinner.rs` — `Spinner` { kind: `Kind::{Fan,Pump}`, rpm, clock }**: a `canvas::Program` that redraws the same blade/impeller geometry as `fan-symbolic.svg` / `pump-symbolic.svg` (paths transcribed into `Path::bezier_curve_to` calls, scaled by `size/16.0`), rotated by `clock * rpm * RPM_TO_RAD_PER_S` (tuned so ~2000 rpm ≈ one screen turn/sec, not the true ~33/sec). Drawn monochrome in theme `background.on`. Used only in popup metric headers (22×22 px), NOT the panel button.
+
+**Animation loop.** `AppModel` gained `anim_t: f32` (seconds) and `Message::AnimationTick`. `subscription()` appends `cosmic::iced::time::every(33ms).map(|_| AnimationTick)` **only when `self.popup.is_some()`**, so the applet does zero continuous redraw when collapsed. `update` advances `anim_t = (anim_t + 0.033) % 3600.0` (wrap before f32 precision degrades; spinners read it modulo a full turn). Each `Spinner` receives `self.anim_t` and computes its own angle from its rpm — one shared clock drives differently-paced fan and pump glyphs.
+
+## Popup Layout (redesigned — src/app.rs::popup_metrics_view)
+
+The popup is a `scrollable` `Column` (spacing 14, padding 16) of: device title (`heading` size 16) → divider → three `metric_block`s → per-fan breakdown (`fan_rows`, indented 8px) → divider → `interval_control` → `device_dropdown_section` → optional error caption. A `metric_block(glyph, label, value, history)` is a header `row![glyph, caption(LABEL), Space::new().width(Fill), mono value]` over the `Equalizer` canvas (`eq_canvas`, 64px tall). Labels are small-caps captions ("COOLANT"/"PUMP"/"FANS"/"SAMPLE INTERVAL"/"DEVICE"); numeric readouts are right-aligned mono via `metric_value(text, size)` (coolant 20px, pump/fan 15px). The coolant header carries a static 18px snowflake glyph; pump/fan headers carry animated `Spinner` glyphs. `Space::new().width(...)` is this iced fork's filler idiom — `Space::new()` takes no args and is configured via builder methods (`Space::with_width` does NOT exist here).
