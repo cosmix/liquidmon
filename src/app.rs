@@ -2,13 +2,15 @@
 
 use crate::config::Config;
 use crate::devices;
+use crate::equalizer::Equalizer;
 use crate::liquidctl::DetectedDevice;
 use crate::sparkline::{Sparkline, SparklineTint};
+use crate::spinner::{Kind, Spinner};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::widget::canvas::Canvas;
-use cosmic::iced::widget::{column, row};
+use cosmic::iced::widget::{Space, column, row};
 use cosmic::iced::{Alignment, Length, Limits, Subscription, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
@@ -30,10 +32,14 @@ const ICON_SNOWFLAKE: &[u8] = include_bytes!("../resources/icons/snowflake-symbo
 const ICON_FAN: &[u8] = include_bytes!("../resources/icons/fan-symbolic.svg");
 const ICON_PUMP: &[u8] = include_bytes!("../resources/icons/pump-symbolic.svg");
 
-fn symbolic_icon(bytes: &'static [u8]) -> widget::icon::Icon {
+fn symbolic_icon_sized(bytes: &'static [u8], size: u16) -> widget::icon::Icon {
     let mut handle = widget::icon::from_svg_bytes(bytes);
     handle.symbolic = true;
-    widget::icon::icon(handle).size(14)
+    widget::icon::icon(handle).size(size)
+}
+
+fn symbolic_icon(bytes: &'static [u8]) -> widget::icon::Icon {
+    symbolic_icon_sized(bytes, 14)
 }
 
 fn fan_duty_avg(fans: &[crate::liquidctl::Fan]) -> Option<u8> {
@@ -61,25 +67,78 @@ fn push_capped(buf: &mut VecDeque<f64>, value: f64) {
     }
 }
 
-/// Build one popup metric section: caption label, sparkline canvas, numeric
-/// body. Extracted so `view_window` stays under the file's 50-line per-fn
-/// soft limit.
-fn metric_section<'a>(
-    label: &'a str,
-    history: &VecDeque<f64>,
-    height: f32,
-    value_text: String,
-) -> Element<'a, Message> {
-    let sparkline = Canvas::new(Sparkline::new(history.iter().copied()))
-        .width(Length::Fixed(320.0))
-        .height(Length::Fixed(height));
+/// Absolute VU-meter ranges anchoring the equalizer's green/amber/red ramp to
+/// real magnitude: coolant temperature in °C and duty cycle in %. (Auto-scaling
+/// would paint the tallest bar red regardless of the actual value.)
+const TEMP_RANGE: (f64, f64) = (20.0, 55.0);
+const DUTY_RANGE: (f64, f64) = (0.0, 100.0);
 
-    column![
+/// The 80s graphic-EQ canvas for a metric history, sized to fill the popup
+/// width so it tracks the popup's responsive width bounds. `range` is the
+/// absolute (lo, hi) the meter normalises against.
+fn eq_canvas(history: &VecDeque<f64>, height: f32, range: (f64, f64)) -> Element<'_, Message> {
+    Canvas::new(Equalizer::new(history.iter().copied(), range.0, range.1))
+        .width(Length::Fill)
+        .height(Length::Fixed(height))
+        .into()
+}
+
+/// One popup metric block: a header row (leading glyph, small-caps label,
+/// right-aligned mono value) above the equalizer canvas. Extracted so
+/// `popup_metrics_view` stays under the file's per-fn soft limit.
+fn metric_block<'a>(
+    glyph: Element<'a, Message>,
+    label: &'a str,
+    value: Element<'a, Message>,
+    history: &'a VecDeque<f64>,
+    range: (f64, f64),
+) -> Element<'a, Message> {
+    let header = row![
+        glyph,
         widget::text::caption(label),
-        sparkline,
-        widget::text::body(value_text).font(cosmic::font::mono()),
+        Space::new().width(Length::Fill),
+        value,
     ]
-    .spacing(4)
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    column![header, eq_canvas(history, 64.0, range)]
+        .spacing(6)
+        .into()
+}
+
+/// Right-aligned mono value text at a given size, the shared style for every
+/// metric header's numeric readout.
+fn metric_value(text: String, size: f32) -> Element<'static, Message> {
+    widget::text::body(text)
+        .font(cosmic::font::mono())
+        .size(size)
+        .into()
+}
+
+/// Per-fan breakdown rows, indented under the FANS block. The shared mono
+/// format string keeps the rpm and duty columns vertically aligned with the
+/// caption rows above.
+fn fan_rows(status: &crate::liquidctl::AioStatus) -> Element<'_, Message> {
+    let row_fmt = |label: &str, rpm: u32, duty: u8| -> String {
+        format!("{label:<6}{rpm:>5} rpm   {duty:>3} %")
+    };
+    let mut rows: Vec<Element<'_, Message>> = Vec::with_capacity(status.fans.len());
+    for fan in &status.fans {
+        rows.push(
+            widget::text::caption(row_fmt(
+                &format!("fan {}", fan.index),
+                fan.speed_rpm,
+                fan.duty_pct,
+            ))
+            .font(cosmic::font::mono())
+            .into(),
+        );
+    }
+    row![
+        Space::new().width(Length::Fixed(8.0)),
+        cosmic::iced::widget::Column::with_children(rows).spacing(2),
+    ]
     .into()
 }
 
@@ -118,6 +177,9 @@ pub struct AppModel {
     /// True while a `liquidctl list` task is in flight, so the popup can
     /// show a "Detecting devices…" placeholder and avoid concurrent requests.
     device_scan_in_flight: bool,
+    /// Accumulating animation clock in seconds, advanced only while the popup
+    /// is open. Drives the rotation of the fan/pump spinner glyphs.
+    anim_t: f32,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -140,6 +202,8 @@ pub enum Message {
     DevicesEnumerated(Result<Vec<DetectedDevice>, String>),
     /// User chose a device from the popup dropdown. `None` means revert to Auto.
     DeviceSelected(Option<String>),
+    /// Animation frame tick — advances the spinner clock while the popup is open.
+    AnimationTick,
 }
 
 /// Create a COSMIC application from the app model
@@ -336,6 +400,15 @@ impl cosmic::Application for AppModel {
             }));
         }
 
+        // Only animate the spinner glyphs while the popup is actually visible,
+        // so the applet does no continuous redraw work when collapsed.
+        if self.popup.is_some() {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(33))
+                    .map(|_| Message::AnimationTick),
+            );
+        }
+
         Subscription::batch(subs)
     }
 
@@ -383,6 +456,11 @@ impl cosmic::Application for AppModel {
             }
             Message::SampleIntervalReleased => {
                 self.commit_pending_interval();
+            }
+            Message::AnimationTick => {
+                // Wrap well before f32 precision degrades; the spinners only
+                // read this modulo a full turn anyway.
+                self.anim_t = (self.anim_t + 0.033) % 3600.0;
             }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
@@ -470,57 +548,58 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
-    /// Render the populated popup body — three metric sections (coolant temp,
-    /// pump duty, fan-average duty), the sample-rate slider, and an optional
-    /// error caption — wrapped in a `scrollable` so constrained panels degrade
-    /// to scroll instead of clipping.
+    /// Render the populated popup body: a device title, three equalizer metric
+    /// blocks (coolant / pump / fans) with right-aligned mono readouts and
+    /// animated fan & pump glyphs, the per-fan breakdown, then the sample-rate
+    /// and device controls below a divider. Wrapped in a `scrollable` so a
+    /// constrained panel degrades to scroll rather than clipping.
     fn popup_metrics_view<'a>(
         &'a self,
         status: &'a crate::liquidctl::AioStatus,
         maybe_err: Option<&'a str>,
     ) -> Element<'a, Message> {
-        let pump_text = format!(
-            "{rpm:>5} rpm   {duty:>3} %",
-            rpm = status.pump.speed_rpm,
-            duty = status.pump.duty_pct,
-        );
+        let fan_rpm = fan_speed_avg(&status.fans).unwrap_or(0);
+        let fan_val = match (fan_speed_avg(&status.fans), fan_duty_avg(&status.fans)) {
+            (Some(rpm), Some(pct)) => format!("{rpm} rpm · {pct} %"),
+            _ => "— rpm".to_string(),
+        };
 
-        // Live drag value falls back to the persisted setting when not dragging.
-        // The slider itself is f32; the persisted value is u64 ms — the cast is
-        // narrowing only above ~16 million ms which we clamp far below.
-        #[allow(clippy::cast_precision_loss)]
-        let secs = self
-            .pending_interval_secs
-            .unwrap_or((self.config.sample_interval_ms as f32) / 1000.0);
-
-        let slider = widget::slider(1.0..=10.0_f32, secs, Message::SampleIntervalDragged)
-            .step(0.5_f32)
-            .on_release(Message::SampleIntervalReleased)
-            .width(Length::Fill);
-
-        let mut sections: Vec<Element<'a, Message>> = Vec::with_capacity(6);
-        sections.push(widget::text::heading(status.description.clone()).into());
-        sections.push(metric_section(
-            "Coolant temperature",
-            &self.temp_history,
-            80.0,
-            format!("{:.1} °C", status.liquid_temp_c),
-        ));
-        sections.push(metric_section(
-            "Pump",
-            &self.pump_duty_history,
-            80.0,
-            pump_text,
-        ));
-        sections.push(self.fans_section(status));
+        let mut sections: Vec<Element<'a, Message>> = Vec::with_capacity(9);
         sections.push(
-            column![
-                widget::text::body(format!("Sample interval: {secs:.1} s")),
-                slider,
-            ]
-            .spacing(4)
-            .into(),
+            widget::text::heading(status.description.clone())
+                .size(16.0)
+                .into(),
         );
+        sections.push(widget::divider::horizontal::default().into());
+        sections.push(metric_block(
+            symbolic_icon_sized(ICON_SNOWFLAKE, 18).into(),
+            "COOLANT",
+            metric_value(format!("{:.1} °C", status.liquid_temp_c), 20.0),
+            &self.temp_history,
+            TEMP_RANGE,
+        ));
+        sections.push(metric_block(
+            self.spinner_glyph(Kind::Pump, status.pump.speed_rpm),
+            "PUMP",
+            metric_value(
+                format!("{} rpm · {} %", status.pump.speed_rpm, status.pump.duty_pct),
+                15.0,
+            ),
+            &self.pump_duty_history,
+            DUTY_RANGE,
+        ));
+        sections.push(metric_block(
+            self.spinner_glyph(Kind::Fan, fan_rpm),
+            "FANS",
+            metric_value(fan_val, 15.0),
+            &self.fan_avg_duty_history,
+            DUTY_RANGE,
+        ));
+        if !status.fans.is_empty() {
+            sections.push(fan_rows(status));
+        }
+        sections.push(widget::divider::horizontal::default().into());
+        sections.push(self.interval_control());
         sections.push(self.device_dropdown_section());
         if let Some(err) = maybe_err {
             sections.push(widget::text::caption(format!("error: {err}")).into());
@@ -528,68 +607,46 @@ impl AppModel {
 
         widget::scrollable(
             cosmic::iced::widget::Column::with_children(sections)
-                .spacing(12)
-                .padding(12),
+                .spacing(14)
+                .padding(16),
         )
         .into()
     }
 
-    /// Fans section: average-duty sparkline, average row in body mono, then
-    /// one mono caption row per fan with right-aligned numeric columns so the
-    /// rpm and duty values line up vertically — non-uniform fans stay easy to
-    /// spot at a glance. Falls back to a single em-dash row when the device
-    /// reports no fans.
-    fn fans_section<'a>(&'a self, status: &'a crate::liquidctl::AioStatus) -> Element<'a, Message> {
-        let sparkline = Canvas::new(Sparkline::new(self.fan_avg_duty_history.iter().copied()))
-            .width(Length::Fixed(320.0))
-            .height(Length::Fixed(80.0));
-
-        // Single shared row format. With the mono font, identical column
-        // widths in the format string translate directly to vertical column
-        // alignment between the avg row and every per-fan row.
-        let row_fmt = |label: &str, rpm: u32, duty: u8| -> String {
-            format!("{label:<6}{rpm:>5} rpm   {duty:>3} %")
-        };
-
-        let avg_line = match (fan_speed_avg(&status.fans), fan_duty_avg(&status.fans)) {
-            (Some(rpm), Some(pct)) => row_fmt("avg", rpm, pct),
-            _ => "—".to_string(),
-        };
-
-        let mut children: Vec<Element<'a, Message>> = vec![
-            widget::text::caption("Fans").into(),
-            sparkline.into(),
-            widget::text::caption(avg_line)
-                .font(cosmic::font::mono())
-                .into(),
-        ];
-
-        // Per-fan rows live in a tightly-spaced sub-column so the breakdown
-        // reads as a compact group. They share font + format string with the
-        // avg row above so the rpm and duty digits line up vertically.
-        if !status.fans.is_empty() {
-            let mut fan_rows: Vec<Element<'a, Message>> = Vec::with_capacity(status.fans.len());
-            for fan in &status.fans {
-                fan_rows.push(
-                    widget::text::caption(row_fmt(
-                        &format!("fan {}", fan.index),
-                        fan.speed_rpm,
-                        fan.duty_pct,
-                    ))
-                    .font(cosmic::font::mono())
-                    .into(),
-                );
-            }
-            children.push(
-                cosmic::iced::widget::Column::with_children(fan_rows)
-                    .spacing(1)
-                    .into(),
-            );
-        }
-
-        cosmic::iced::widget::Column::with_children(children)
-            .spacing(4)
+    /// A small animated fan/pump glyph canvas for a metric header, spinning at
+    /// a rate derived from `rpm` and the popup-scoped animation clock.
+    fn spinner_glyph(&self, kind: Kind, rpm: u32) -> Element<'_, Message> {
+        Canvas::new(Spinner::new(kind, rpm, self.anim_t))
+            .width(Length::Fixed(22.0))
+            .height(Length::Fixed(22.0))
             .into()
+    }
+
+    /// Sample-interval control: a small-caps label with a right-aligned mono
+    /// readout above the slider.
+    fn interval_control(&self) -> Element<'_, Message> {
+        // Live drag value falls back to the persisted setting when not dragging.
+        // The slider is f32; the persisted value is u64 ms — narrowing only
+        // above ~16 million ms, which we clamp far below.
+        #[allow(clippy::cast_precision_loss)]
+        let secs = self
+            .pending_interval_secs
+            .unwrap_or((self.config.sample_interval_ms as f32) / 1000.0);
+
+        let header = row![
+            widget::text::caption("SAMPLE INTERVAL"),
+            Space::new().width(Length::Fill),
+            widget::text::body(format!("{secs:.1} s")).font(cosmic::font::mono()),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let slider = widget::slider(1.0..=10.0_f32, secs, Message::SampleIntervalDragged)
+            .step(0.5_f32)
+            .on_release(Message::SampleIntervalReleased)
+            .width(Length::Fill);
+
+        column![header, slider].spacing(6).into()
     }
 
     /// Clear all per-device state when the effective device changes so
@@ -672,9 +729,12 @@ impl AppModel {
             } else {
                 "No supported AIO detected"
             };
-            return column![widget::text::body("Device"), widget::text::caption(caption)]
-                .spacing(4)
-                .into();
+            return column![
+                widget::text::caption("DEVICE"),
+                widget::text::caption(caption)
+            ]
+            .spacing(6)
+            .into();
         }
 
         let items = self.device_dropdown_items();
@@ -694,8 +754,8 @@ impl AppModel {
             Message::DeviceSelected(choice)
         });
 
-        column![widget::text::body("Device"), dropdown]
-            .spacing(4)
+        column![widget::text::caption("DEVICE"), dropdown]
+            .spacing(6)
             .into()
     }
 
