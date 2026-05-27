@@ -14,6 +14,8 @@ reading is kept on display and the popup shows the underlying error — so a
 frozen temperature reading combined with an error in the popup means liquidctl
 has stopped responding.
 
+![LiquidMon panel applet and popup](doc/images/liquidmon.png)
+
 App ID: `com.github.cosmix.LiquidMon`
 
 ## Supported Devices
