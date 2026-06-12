@@ -2,15 +2,15 @@
 
 use crate::config::Config;
 use crate::devices;
-use crate::equalizer::Equalizer;
 use crate::liquidctl::DetectedDevice;
 use crate::sparkline::{Sparkline, SparklineTint};
-use crate::spinner::{Kind, Spinner};
+use crate::spinner::Kind;
+use crate::view;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup};
 use cosmic::iced::widget::canvas::Canvas;
-use cosmic::iced::widget::{Space, column, row};
+use cosmic::iced::widget::row;
 use cosmic::iced::{Alignment, Length, Limits, Subscription, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
@@ -27,35 +27,37 @@ const HISTORY_CAP: usize = 900;
 const MIN_INTERVAL_MS: u64 = 1000;
 const MAX_INTERVAL_MS: u64 = 10000;
 
-const ICON_TEMP: &[u8] = include_bytes!("../resources/icons/temperature-symbolic.svg");
-const ICON_SNOWFLAKE: &[u8] = include_bytes!("../resources/icons/snowflake-symbolic.svg");
-const ICON_FAN: &[u8] = include_bytes!("../resources/icons/fan-symbolic.svg");
-const ICON_PUMP: &[u8] = include_bytes!("../resources/icons/pump-symbolic.svg");
-
-fn symbolic_icon_sized(bytes: &'static [u8], size: u16) -> widget::icon::Icon {
-    let mut handle = widget::icon::from_svg_bytes(bytes);
-    handle.symbolic = true;
-    widget::icon::icon(handle).size(size)
-}
-
-fn symbolic_icon(bytes: &'static [u8]) -> widget::icon::Icon {
-    symbolic_icon_sized(bytes, 14)
-}
+/// Cadence of the popup spinner animation. Drives both the `every(...)`
+/// subscription interval and the per-tick `anim_t` advance, so the clock
+/// stays consistent with the wall-clock tick rate from a single source.
+const ANIM_INTERVAL: Duration = Duration::from_millis(33);
 
 fn fan_duty_avg(fans: &[crate::liquidctl::Fan]) -> Option<u8> {
     if fans.is_empty() {
         return None;
     }
+    // `len` is a fan count (single digits) and the rounded mean of values each
+    // ≤ 100 stays ≤ 100, so both casts are in range.
+    #[allow(clippy::cast_possible_truncation)]
+    let len = fans.len() as u32;
     let sum: u32 = fans.iter().map(|f| u32::from(f.duty_pct)).sum();
-    Some((sum / fans.len() as u32) as u8)
+    // Round to nearest rather than truncating toward zero: e.g. 41% + 50%
+    // averages to 46, not 45.
+    #[allow(clippy::cast_possible_truncation)]
+    Some(((sum + len / 2) / len) as u8)
 }
 
 fn fan_speed_avg(fans: &[crate::liquidctl::Fan]) -> Option<u32> {
     if fans.is_empty() {
         return None;
     }
+    // The rounded mean of `u32` rpm values never exceeds the maximum input, so
+    // it fits back into `u32`.
+    let len = fans.len() as u64;
     let sum: u64 = fans.iter().map(|f| u64::from(f.speed_rpm)).sum();
-    Some((sum / fans.len() as u64) as u32)
+    // Round to nearest rather than truncating toward zero.
+    #[allow(clippy::cast_possible_truncation)]
+    Some(((sum + len / 2) / len) as u32)
 }
 
 /// Push a new sample onto a metric history, evicting from the front to keep
@@ -67,79 +69,21 @@ fn push_capped(buf: &mut VecDeque<f64>, value: f64) {
     }
 }
 
-/// Absolute VU-meter ranges anchoring the equalizer's green/amber/red ramp to
-/// real magnitude: coolant temperature in °C and duty cycle in %. (Auto-scaling
-/// would paint the tallest bar red regardless of the actual value.)
-const TEMP_RANGE: (f64, f64) = (20.0, 55.0);
-const DUTY_RANGE: (f64, f64) = (0.0, 100.0);
-
-/// The 80s graphic-EQ canvas for a metric history, sized to fill the popup
-/// width so it tracks the popup's responsive width bounds. `range` is the
-/// absolute (lo, hi) the meter normalises against.
-fn eq_canvas(history: &VecDeque<f64>, height: f32, range: (f64, f64)) -> Element<'_, Message> {
-    Canvas::new(Equalizer::new(history.iter().copied(), range.0, range.1))
-        .width(Length::Fill)
-        .height(Length::Fixed(height))
-        .into()
-}
-
-/// One popup metric block: a header row (leading glyph, small-caps label,
-/// right-aligned mono value) above the equalizer canvas. Extracted so
-/// `popup_metrics_view` stays under the file's per-fn soft limit.
-fn metric_block<'a>(
-    glyph: Element<'a, Message>,
-    label: &'a str,
-    value: Element<'a, Message>,
-    history: &'a VecDeque<f64>,
-    range: (f64, f64),
-) -> Element<'a, Message> {
-    let header = row![
-        glyph,
-        widget::text::caption(label),
-        Space::new().width(Length::Fill),
-        value,
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-
-    column![header, eq_canvas(history, 64.0, range)]
-        .spacing(6)
-        .into()
-}
-
-/// Right-aligned mono value text at a given size, the shared style for every
-/// metric header's numeric readout.
-fn metric_value(text: String, size: f32) -> Element<'static, Message> {
-    widget::text::body(text)
-        .font(cosmic::font::mono())
-        .size(size)
-        .into()
-}
-
-/// Per-fan breakdown rows, indented under the FANS block. The shared mono
-/// format string keeps the rpm and duty columns vertically aligned with the
-/// caption rows above.
-fn fan_rows(status: &crate::liquidctl::AioStatus) -> Element<'_, Message> {
-    let row_fmt = |label: &str, rpm: u32, duty: u8| -> String {
-        format!("{label:<6}{rpm:>5} rpm   {duty:>3} %")
-    };
-    let mut rows: Vec<Element<'_, Message>> = Vec::with_capacity(status.fans.len());
-    for fan in &status.fans {
-        rows.push(
-            widget::text::caption(row_fmt(
-                &format!("fan {}", fan.index),
-                fan.speed_rpm,
-                fan.duty_pct,
-            ))
-            .font(cosmic::font::mono())
-            .into(),
-        );
-    }
-    row![
-        Space::new().width(Length::Fixed(8.0)),
-        cosmic::iced::widget::Column::with_children(rows).spacing(2),
-    ]
-    .into()
+/// Build a device-enumeration `Task` that runs `liquidctl list` and maps the
+/// result into `Message::DevicesEnumerated`. An optional `delay` sleeps first,
+/// used by the one-shot retry after a failed initial scan.
+fn enumerate_task(delay: Option<Duration>) -> Task<cosmic::Action<Message>> {
+    Task::perform(
+        async move {
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
+            crate::liquidctl::list_devices()
+                .await
+                .map_err(|e| format!("{e}"))
+        },
+        |r| cosmic::Action::App(Message::DevicesEnumerated(r)),
+    )
 }
 
 /// The application model stores app-specific state used to describe its interface and
@@ -180,6 +124,11 @@ pub struct AppModel {
     /// Accumulating animation clock in seconds, advanced only while the popup
     /// is open. Drives the rotation of the fan/pump spinner glyphs.
     anim_t: f32,
+    /// Whether the one-shot automatic re-enumeration after a failed initial
+    /// scan has already been scheduled. Guards the retry so a persistently
+    /// failing `liquidctl list` cannot spin in a tight loop — it fires at most
+    /// once until a device becomes known.
+    enumeration_retried: bool,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -252,15 +201,7 @@ impl cosmic::Application for AppModel {
             ..Default::default()
         };
 
-        let init_task = Task::perform(
-            async {
-                crate::liquidctl::list_devices()
-                    .await
-                    .map_err(|e| format!("{e}"))
-            },
-            |r| cosmic::Action::App(Message::DevicesEnumerated(r)),
-        );
-        (app, init_task)
+        (app, enumerate_task(None))
     }
 
     fn on_close_requested(&self, id: Id) -> Option<Message> {
@@ -298,17 +239,20 @@ impl cosmic::Application for AppModel {
                         .width(Length::Fixed(36.0))
                         .height(Length::Fixed(16.0));
 
-                let coolant_glyph = row![symbolic_icon(ICON_SNOWFLAKE), symbolic_icon(ICON_TEMP),]
-                    .spacing(1)
-                    .align_y(Alignment::Center);
+                let coolant_glyph = row![
+                    view::symbolic_icon(view::ICON_SNOWFLAKE),
+                    view::symbolic_icon(view::ICON_TEMP),
+                ]
+                .spacing(1)
+                .align_y(Alignment::Center);
 
                 row![
                     coolant_glyph,
                     self.core.applet.text(temp_text).font(cosmic::font::mono()),
                     sparkline,
-                    symbolic_icon(ICON_FAN),
+                    view::symbolic_icon(view::ICON_FAN),
                     self.core.applet.text(fan_text).font(cosmic::font::mono()),
-                    symbolic_icon(ICON_PUMP),
+                    view::symbolic_icon(view::ICON_PUMP),
                     self.core.applet.text(pump_text).font(cosmic::font::mono()),
                 ]
                 .spacing(4)
@@ -378,7 +322,15 @@ impl cosmic::Application for AppModel {
                 cosmic::iced::stream::channel(
                     4,
                     move |mut channel: mpsc::Sender<Message>| async move {
+                        // Tick at the TOP of the loop so the period is measured
+                        // tick-to-tick, independent of how long each fetch takes.
+                        // The first tick resolves immediately (preserving the
+                        // immediate first poll). `Delay` skips any missed ticks
+                        // after a slow fetch instead of bursting to catch up.
+                        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
+                            ticker.tick().await;
                             let result = crate::liquidctl::fetch_status(&match_str)
                                 .await
                                 .map_err(|e| format!("{e}"));
@@ -390,11 +342,13 @@ impl cosmic::Application for AppModel {
                                 .await
                                 .is_err()
                             {
-                                break;
+                                // Channel closed (applet shutting down): the
+                                // stream is finished, so just return. A returned
+                                // stream simply stops producing — no need to
+                                // park on `pending()`.
+                                return;
                             }
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
                         }
-                        futures_util::future::pending().await
                     },
                 )
             }));
@@ -403,10 +357,7 @@ impl cosmic::Application for AppModel {
         // Only animate the spinner glyphs while the popup is actually visible,
         // so the applet does no continuous redraw work when collapsed.
         if self.popup.is_some() {
-            subs.push(
-                cosmic::iced::time::every(Duration::from_millis(33))
-                    .map(|_| Message::AnimationTick),
-            );
+            subs.push(cosmic::iced::time::every(ANIM_INTERVAL).map(|_| Message::AnimationTick));
         }
 
         Subscription::batch(subs)
@@ -458,12 +409,16 @@ impl cosmic::Application for AppModel {
                 self.commit_pending_interval();
             }
             Message::AnimationTick => {
-                // Wrap well before f32 precision degrades; the spinners only
-                // read this modulo a full turn anyway.
-                self.anim_t = (self.anim_t + 0.033) % 3600.0;
+                // Advance by the animation interval itself so the clock and the
+                // tick rate share one source. Wrap well before f32 precision
+                // degrades; the spinners only read this modulo a full turn.
+                self.anim_t = (self.anim_t + ANIM_INTERVAL.as_secs_f32()) % 3600.0;
             }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
+                    // Closing mid-drag: drop any half-dragged slider value so the
+                    // next open shows the persisted setting, not a stale value.
+                    self.pending_interval_secs = None;
                     destroy_popup(p)
                 } else {
                     let Some(parent) = self.core.main_window_id() else {
@@ -490,21 +445,16 @@ impl cosmic::Application for AppModel {
                         // prevents a second concurrent enumerate if the user
                         // toggles the popup faster than `list` returns.
                         self.device_scan_in_flight = true;
-                        let enumerate = Task::perform(
-                            async {
-                                crate::liquidctl::list_devices()
-                                    .await
-                                    .map_err(|e| format!("{e}"))
-                            },
-                            |r| cosmic::Action::App(Message::DevicesEnumerated(r)),
-                        );
-                        Task::batch(vec![get_popup_task, enumerate])
+                        Task::batch(vec![get_popup_task, enumerate_task(None)])
                     }
                 };
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
+                    // Compositor-driven close (Esc / outside click) also skips
+                    // slider release, so clear any staged drag value here too.
+                    self.pending_interval_secs = None;
                 }
             }
             Message::DevicesEnumerated(Ok(devs)) => {
@@ -522,8 +472,21 @@ impl cosmic::Application for AppModel {
                 }
             }
             Message::DevicesEnumerated(Err(msg)) => {
-                self.last_error = Some(msg);
+                // Make the error actionable: the same recovery path the
+                // "no AIO detected" case offers, since the panel otherwise
+                // sticks on `!` until the user opens the popup manually.
+                self.last_error = Some(format!("{msg} — open the popup to select a device"));
                 self.device_scan_in_flight = false;
+                // One bounded automatic retry: if enumeration failed and no
+                // device is known yet, schedule a single delayed re-scan so a
+                // transient failure (e.g. a momentary liquidctl timeout) self-
+                // heals without user interaction. Guarded by
+                // `enumeration_retried` so it fires AT MOST once and cannot loop.
+                if self.effective_match().is_none() && !self.enumeration_retried {
+                    self.enumeration_retried = true;
+                    self.device_scan_in_flight = true;
+                    return enumerate_task(Some(Duration::from_secs(3)));
+                }
             }
             Message::DeviceSelected(choice) => {
                 if self.config.device_match != choice {
@@ -564,43 +527,52 @@ impl AppModel {
             _ => "— rpm".to_string(),
         };
 
-        let mut sections: Vec<Element<'a, Message>> = Vec::with_capacity(9);
+        // Section count varies (8–10) with the optional fan-rows and error
+        // caption, so a fixed capacity hint would be misleading; let the Vec grow.
+        let mut sections: Vec<Element<'a, Message>> = Vec::new();
         sections.push(
             widget::text::heading(status.description.clone())
                 .size(16.0)
                 .into(),
         );
         sections.push(widget::divider::horizontal::default().into());
-        sections.push(metric_block(
-            symbolic_icon_sized(ICON_SNOWFLAKE, 18).into(),
+        sections.push(view::metric_block(
+            view::symbolic_icon_sized(view::ICON_SNOWFLAKE, 18).into(),
             "COOLANT",
-            metric_value(format!("{:.1} °C", status.liquid_temp_c), 20.0),
+            view::metric_value(format!("{:.1} °C", status.liquid_temp_c), 20.0),
             &self.temp_history,
-            TEMP_RANGE,
+            view::TEMP_RANGE,
         ));
-        sections.push(metric_block(
-            self.spinner_glyph(Kind::Pump, status.pump.speed_rpm),
+        sections.push(view::metric_block(
+            view::spinner_glyph(self.anim_t, Kind::Pump, status.pump.speed_rpm),
             "PUMP",
-            metric_value(
+            view::metric_value(
                 format!("{} rpm · {} %", status.pump.speed_rpm, status.pump.duty_pct),
                 15.0,
             ),
             &self.pump_duty_history,
-            DUTY_RANGE,
+            view::DUTY_RANGE,
         ));
-        sections.push(metric_block(
-            self.spinner_glyph(Kind::Fan, fan_rpm),
+        sections.push(view::metric_block(
+            view::spinner_glyph(self.anim_t, Kind::Fan, fan_rpm),
             "FANS",
-            metric_value(fan_val, 15.0),
+            view::metric_value(fan_val, 15.0),
             &self.fan_avg_duty_history,
-            DUTY_RANGE,
+            view::DUTY_RANGE,
         ));
         if !status.fans.is_empty() {
-            sections.push(fan_rows(status));
+            sections.push(view::fan_rows(status));
         }
         sections.push(widget::divider::horizontal::default().into());
-        sections.push(self.interval_control());
-        sections.push(self.device_dropdown_section());
+        sections.push(view::interval_control(
+            self.pending_interval_secs,
+            self.config.sample_interval_ms,
+        ));
+        sections.push(view::device_dropdown_section(
+            &self.detected_devices,
+            self.config.device_match.as_deref(),
+            self.device_scan_in_flight,
+        ));
         if let Some(err) = maybe_err {
             sections.push(widget::text::caption(format!("error: {err}")).into());
         }
@@ -611,42 +583,6 @@ impl AppModel {
                 .padding(16),
         )
         .into()
-    }
-
-    /// A small animated fan/pump glyph canvas for a metric header, spinning at
-    /// a rate derived from `rpm` and the popup-scoped animation clock.
-    fn spinner_glyph(&self, kind: Kind, rpm: u32) -> Element<'_, Message> {
-        Canvas::new(Spinner::new(kind, rpm, self.anim_t))
-            .width(Length::Fixed(22.0))
-            .height(Length::Fixed(22.0))
-            .into()
-    }
-
-    /// Sample-interval control: a small-caps label with a right-aligned mono
-    /// readout above the slider.
-    fn interval_control(&self) -> Element<'_, Message> {
-        // Live drag value falls back to the persisted setting when not dragging.
-        // The slider is f32; the persisted value is u64 ms — narrowing only
-        // above ~16 million ms, which we clamp far below.
-        #[allow(clippy::cast_precision_loss)]
-        let secs = self
-            .pending_interval_secs
-            .unwrap_or((self.config.sample_interval_ms as f32) / 1000.0);
-
-        let header = row![
-            widget::text::caption("SAMPLE INTERVAL"),
-            Space::new().width(Length::Fill),
-            widget::text::body(format!("{secs:.1} s")).font(cosmic::font::mono()),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let slider = widget::slider(1.0..=10.0_f32, secs, Message::SampleIntervalDragged)
-            .step(0.5_f32)
-            .on_release(Message::SampleIntervalReleased)
-            .width(Length::Fill);
-
-        column![header, slider].spacing(6).into()
     }
 
     /// Clear all per-device state when the effective device changes so
@@ -667,96 +603,6 @@ impl AppModel {
             .device_match
             .clone()
             .or_else(|| devices::auto_select(&self.detected_devices).map(|d| d.description.clone()))
-    }
-
-    /// Build the device dropdown items: `Auto (...)` at index 0, then each
-    /// connected AIO that isn't the auto-pick (the auto entry already names
-    /// it), then optionally a synthetic `<saved> (disconnected)` row if the
-    /// saved choice isn't currently connected.
-    fn device_dropdown_items(&self) -> Vec<String> {
-        let aios: Vec<&DetectedDevice> = devices::filter_aios(&self.detected_devices);
-        let auto_pick = devices::auto_select(&self.detected_devices);
-        let auto_label = match auto_pick {
-            Some(d) => format!("Auto ({})", d.description),
-            None => "Auto (no AIO detected)".to_string(),
-        };
-
-        let mut items = vec![auto_label];
-        let auto_desc = auto_pick.map(|d| d.description.as_str());
-        items.extend(
-            aios.iter()
-                .filter(|d| Some(d.description.as_str()) != auto_desc)
-                .map(|d| d.description.clone()),
-        );
-
-        if let Some(saved) = self.config.device_match.as_ref()
-            && !aios.iter().any(|d| &d.description == saved)
-        {
-            items.push(format!("{saved} (disconnected)"));
-        }
-        items
-    }
-
-    /// Resolve the currently-selected dropdown index. `None` (saved choice
-    /// is unset) maps to index 0 (Auto). A saved choice that matches the
-    /// auto-pick also maps to Auto, since the explicit row is intentionally
-    /// hidden from the list to avoid duplicating the device under both Auto
-    /// and a standalone entry. Otherwise the saved choice maps to its row
-    /// (connected or `(disconnected)` synthetic).
-    fn device_dropdown_selected(&self, items: &[String]) -> Option<usize> {
-        match self.config.device_match.as_deref() {
-            None => Some(0),
-            Some(saved) => {
-                let auto_desc =
-                    devices::auto_select(&self.detected_devices).map(|d| d.description.as_str());
-                if auto_desc == Some(saved) {
-                    return Some(0);
-                }
-                items
-                    .iter()
-                    .position(|s| s == saved || s == &format!("{saved} (disconnected)"))
-            }
-        }
-    }
-
-    /// Build the device-selector section of the popup: a `Device` label
-    /// over a dropdown, or a status caption while detection is pending or
-    /// no AIO is connected.
-    fn device_dropdown_section<'a>(&'a self) -> Element<'a, Message> {
-        if self.detected_devices.is_empty() && self.config.device_match.is_none() {
-            let caption = if self.device_scan_in_flight {
-                "Detecting devices…"
-            } else {
-                "No supported AIO detected"
-            };
-            return column![
-                widget::text::caption("DEVICE"),
-                widget::text::caption(caption)
-            ]
-            .spacing(6)
-            .into();
-        }
-
-        let items = self.device_dropdown_items();
-        let selected = self.device_dropdown_selected(&items);
-        // The dropdown's `on_selected` closure must be 'static + Send + Sync,
-        // so it cannot borrow `items`. Clone the list into the closure and
-        // index it there to recover the chosen description.
-        let items_for_closure = items.clone();
-        let dropdown = cosmic::widget::dropdown(items, selected, move |idx: usize| -> Message {
-            let choice = if idx == 0 {
-                None
-            } else {
-                items_for_closure
-                    .get(idx)
-                    .map(|s| s.strip_suffix(" (disconnected)").unwrap_or(s).to_string())
-            };
-            Message::DeviceSelected(choice)
-        });
-
-        column![widget::text::caption("DEVICE"), dropdown]
-            .spacing(6)
-            .into()
     }
 
     /// Apply the staged slider value, clamp to the supported range, and persist
@@ -850,9 +696,11 @@ mod tests {
     }
 
     #[test]
-    fn fan_duty_avg_truncates_toward_zero() {
-        // 40 + 50 = 90 / 2 = 45 (exact). Use 41 + 50 = 91 / 2 = 45 (truncated).
-        assert_eq!(fan_duty_avg(&[fan(1, 41), fan(2, 50)]), Some(45));
+    fn fan_duty_avg_rounds_to_nearest() {
+        // 41 + 50 = 91 / 2 = 45.5 → rounds to 46 (was 45 under truncation).
+        assert_eq!(fan_duty_avg(&[fan(1, 41), fan(2, 50)]), Some(46));
+        // Exact mean is unaffected: 40 + 50 = 90 / 2 = 45.
+        assert_eq!(fan_duty_avg(&[fan(1, 40), fan(2, 50)]), Some(45));
     }
 
     #[test]
@@ -874,6 +722,15 @@ mod tests {
             Some(2000)
         );
         assert_eq!(fan_speed_avg(&[]), None);
+    }
+
+    #[test]
+    fn fan_speed_avg_rounds_to_nearest() {
+        // 1000 + 1001 = 2001 / 2 = 1000.5 → rounds to 1001 (was 1000 truncated).
+        assert_eq!(
+            fan_speed_avg(&[fan_with_speed(1, 1000), fan_with_speed(2, 1001)]),
+            Some(1001)
+        );
     }
 
     #[test]
@@ -1248,9 +1105,40 @@ mod tests {
 
         let _ = model.update(Message::DevicesEnumerated(Err("boom".to_string())));
 
-        assert_eq!(model.last_error.as_deref(), Some("boom"));
+        // M2: the raw error is suffixed with actionable recovery guidance.
+        let err = model.last_error.as_deref().expect("error set");
+        assert!(err.starts_with("boom"), "got {err:?}");
+        assert!(
+            err.contains("open the popup to select a device"),
+            "error should carry recovery guidance, got {err:?}",
+        );
         assert!(model.last_status.is_some());
+        // A saved device means effective_match is Some, so no retry is
+        // scheduled and the scan flag clears.
         assert!(!model.device_scan_in_flight);
+    }
+
+    #[test]
+    fn devices_enumerated_err_with_no_device_schedules_single_retry() {
+        // M2: a failed scan with no known device arms the one-shot retry and
+        // keeps the scan-in-flight flag set (the retry task is in flight).
+        let mut model = AppModel {
+            device_scan_in_flight: true,
+            ..AppModel::default()
+        };
+        assert!(model.effective_match().is_none());
+
+        let _ = model.update(Message::DevicesEnumerated(Err("timeout".to_string())));
+        assert!(model.enumeration_retried);
+        assert!(model.device_scan_in_flight);
+
+        // A second failure must NOT re-arm: the guard fires at most once.
+        let _ = model.update(Message::DevicesEnumerated(Err("timeout".to_string())));
+        assert!(model.enumeration_retried);
+        assert!(
+            !model.device_scan_in_flight,
+            "second failure should not schedule another retry",
+        );
     }
 
     #[test]
@@ -1297,78 +1185,41 @@ mod tests {
     }
 
     #[test]
-    fn dropdown_items_includes_auto_first() {
-        let model = AppModel {
-            detected_devices: vec![detected("Corsair Hydro Foo")],
-            ..AppModel::default()
-        };
-        let items = model.device_dropdown_items();
-        assert!(!items.is_empty());
-        assert!(
-            items[0].starts_with("Auto"),
-            "first item should be Auto, got {:?}",
-            items[0],
-        );
+    fn config_default_uses_migration_fallback_values() {
+        // The hand-written Default is what CosmicConfigEntry's field-by-field
+        // fallback consults when upgrading an older on-disk config.
+        let cfg = Config::default();
+        assert_eq!(cfg.sample_interval_ms, 1500);
+        assert_eq!(cfg.device_match, None);
     }
 
     #[test]
-    fn dropdown_items_appends_disconnected_synthetic_when_saved_missing() {
+    fn animation_tick_wraps_at_3600() {
+        // Push the clock just below the wrap; a single tick must roll it over.
         let mut model = AppModel {
-            detected_devices: vec![detected("Corsair Hydro Foo")],
+            anim_t: 3600.0 - (ANIM_INTERVAL.as_secs_f32() / 2.0),
             ..AppModel::default()
         };
-        model.config.device_match = Some("Corsair iCUE Hbar".to_string());
-        let items = model.device_dropdown_items();
+        let _ = model.update(Message::AnimationTick);
         assert!(
-            items
-                .iter()
-                .any(|s| s == "Corsair iCUE Hbar (disconnected)"),
-            "expected disconnected synthetic in {items:?}",
+            model.anim_t < 1.0,
+            "anim_t should wrap near zero, got {}",
+            model.anim_t,
         );
     }
 
     #[test]
-    fn dropdown_items_omits_synthetic_when_saved_is_connected() {
-        let mut model = AppModel {
-            detected_devices: vec![detected("Corsair Hydro Foo")],
-            ..AppModel::default()
-        };
-        model.config.device_match = Some("Corsair Hydro Foo".to_string());
-        let items = model.device_dropdown_items();
-        assert!(
-            !items.iter().any(|s| s.ends_with("(disconnected)")),
-            "no disconnected row when saved is connected, got {items:?}",
-        );
-    }
+    fn popup_closed_clears_pending_interval() {
+        // m8: a compositor-driven close mid-drag skips slider release, so the
+        // staged value must be cleared so the next open isn't stale.
+        let mut model = AppModel::default();
+        let id = Id::unique();
+        model.popup = Some(id);
+        model.pending_interval_secs = Some(7.5);
 
-    #[test]
-    fn dropdown_items_omits_auto_picked_device_from_explicit_list() {
-        // Auto label already names the auto-picked device — listing it
-        // again as its own row would be redundant.
-        let model = AppModel {
-            detected_devices: vec![detected("Corsair Hydro Foo")],
-            ..AppModel::default()
-        };
-        let items = model.device_dropdown_items();
-        assert_eq!(
-            items.len(),
-            1,
-            "single AIO should yield one item (the Auto row only), got {items:?}",
-        );
-        assert!(items[0].starts_with("Auto ("));
-    }
+        let _ = model.update(Message::PopupClosed(id));
 
-    #[test]
-    fn dropdown_items_lists_non_auto_aios_explicitly() {
-        // With multiple AIOs, only the auto-pick is hidden — the others
-        // remain available as explicit rows.
-        let model = AppModel {
-            detected_devices: vec![detected("Corsair Hydro Foo"), detected("Corsair iCUE Hbar")],
-            ..AppModel::default()
-        };
-        let items = model.device_dropdown_items();
-        assert_eq!(items.len(), 2, "got {items:?}");
-        assert!(items[0].starts_with("Auto (Corsair Hydro Foo)"));
-        assert_eq!(items[1], "Corsair iCUE Hbar");
+        assert!(model.popup.is_none());
+        assert_eq!(model.pending_interval_secs, None);
     }
 }

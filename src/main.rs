@@ -7,6 +7,7 @@ mod equalizer;
 mod liquidctl;
 mod sparkline;
 mod spinner;
+mod view;
 
 fn main() -> cosmic::iced::Result {
     cosmic::applet::run::<app::AppModel>(())
