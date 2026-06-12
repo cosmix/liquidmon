@@ -24,23 +24,23 @@ Follow-ups deferred to `PLAN-aio-broad-support.md` (broader liquidctl families r
 
 **Resolved 2026-05-01:** Added `sample_interval_ms: u64` to `Config` (default 1500, `#[version = 2]`, hand-implemented `Default`). A slider in the popup exposes the range 1.0–10.0 s in 0.5 s steps. Drag events stage a transient `pending_interval_secs`; release commits and persists via `config.write_entry(&config_handle)`. The subscription re-keys on the clamped `interval_ms` value via `Subscription::run_with(interval_ms, fn_ptr)` — iced tears down and restarts the poll loop only when the committed value changes, keeping the running loop stable during a drag.
 
-## `value.as_f64()` silently skips entries with non-numeric values
+## `value.as_f64()` silently skips entries with non-numeric values — SUPERSEDED 2026-06-12
 
-`src/liquidctl.rs:162-164` — if `liquidctl` ever emits a status entry with a string or boolean value (e.g. firmware version, firmware checksum), `entry.value.as_f64()` returns `None` and the key is silently skipped. This is acceptable for truly non-numeric keys but masks unexpected numeric entries that fail to parse as f64.
+The silent-skip intent is now correctly implemented. See below.
 
 ## Fan index 0 rejection
 
 `src/liquidctl.rs:219-221` explicitly returns `None` if the parsed fan index is `0`. This is a reasonable assumption for 1-based indexing, but `liquidctl` occasionally uses 0-based indexing for some controllers. Silently dropping `Fan 0` data without logging would be confusing to debug.
 
-## No app-level tests for `app.rs::update` — partially resolved 2026-04-30, expanded 2026-05-01
+## No app-level tests for `app.rs::update` — partially resolved 2026-04-30, expanded 2026-05-01, further expanded 2026-06-12
 
-`src/app.rs` now has a `#[cfg(test)] mod tests` block covering `fan_duty_avg`, `fan_speed_avg`, the `StatusTick(Ok)` / `StatusTick(Err)` / `PopupClosed` / `UpdateConfig` arms of `update`, the `HISTORY_CAP` cap on all metric histories, and the four `SampleInterval*` slider message arms (25 tests total). The test module imports `cosmic::Application as _` to expose the trait method and constructs the model via `AppModel::default()`.
+`src/app.rs` now has 40 tests. `src/view.rs` adds 11 dropdown tests. `src/equalizer.rs` adds 10. `src/sparkline.rs` 9. `src/devices.rs` 6. `src/spinner.rs` 3. Total: 109.
 
-Still untested: `view` / `view_window` rendering, the `subscription` background task, the `TogglePopup` arm (depends on `core.main_window_id()` which requires a live Wayland surface), `fetch_status`'s subprocess invocation, `src/main.rs`, and `src/config.rs`. The first two need a headless iced/cosmic harness; subprocess testing would need a fake `liquidctl` binary on `PATH`.
+Still untested: `view` / `view_window` rendering (trait-method entry points in `app.rs`), the `subscription` background task, the `TogglePopup` arm (depends on `core.main_window_id()` which requires a live Wayland surface), `fetch_status`'s subprocess invocation, `src/main.rs`, and `src/config.rs`. The first two need a headless iced/cosmic harness; subprocess testing would need a fake `liquidctl` binary on `PATH`.
 
 ## `tag` recipe in justfile uses `sed -i` with a fragile in-place substitution
 
-`justfile:76` uses `find -type f -name Cargo.toml -exec sed -i '0,/^version/s/...'`. On macOS, `sed -i` requires an extension argument. Since this project targets Linux only, this is not a portability bug today, but it is worth noting as a platform assumption baked into tooling.
+`justfile` uses `find -type f -name Cargo.toml -exec sed -i '0,/^version/s/...'`. On macOS, `sed -i` requires an extension argument. Since this project targets Linux only, this is not a portability bug today, but it is worth noting as a platform assumption baked into tooling. The recipe now has a semver guard before any mutation (see "tag recipe does not validate version string format — RESOLVED" below).
 
 ## Subprocess command injection risk (low, but present)
 
@@ -62,11 +62,9 @@ The entire codebase assumes Linux. `src/liquidctl.rs:116` spawns `liquidctl` dir
 
 The metainfo/AppStream file does not list a `requires` or `recommends` element for the `liquidctl` binary or a udev rules package. Package managers that parse AppStream data will not know to install `liquidctl` as a dependency.
 
-## `StatusEntry.value` deserialization type mismatch defeats the silent-skip guard
+## `StatusEntry.value` deserialization type mismatch defeats the silent-skip guard — RESOLVED 2026-06-12
 
-`src/liquidctl.rs:107` types `StatusEntry.value` as `serde_json::Number`. The intent of `entry.value.as_f64()` returning `None` (lines 162-164) is to silently skip non-numeric entries. However, `serde_json::Number` only deserializes successfully if the JSON token is a number. If `liquidctl` emits a status entry whose value is a JSON string or boolean (e.g. firmware version as `"1.0.2"`), `serde_json::from_str` at line 143 will return `Error::Parse` for the entire device, not `None` for that entry. The silent-skip behaviour at line 162 is therefore unreachable for non-numeric value types. Fix: type `value` as `serde_json::Value` and then call `.as_f64()` on it.
-
-Severity: medium — may cause complete parse failure when a future liquidctl version adds string-typed status fields.
+`StatusEntry.value` is now typed as `serde_json::Value` (not `serde_json::Number`). A string/boolean/null value in a status entry now deserializes successfully and is silently skipped via the `as_f64()` guard, rather than failing the entire device parse with `Error::Parse`. The comment in `src/liquidctl.rs` documents the rationale. The silent-skip concern is resolved.
 
 ## Sparkline Y-axis hardcoded to 10–40°C — RESOLVED 2026-05-01
 
@@ -76,23 +74,17 @@ Originally `src/sparkline.rs:41-42` set `Y_MIN = 10.0` and `Y_MAX = 40.0`. Value
 
 Severity: was low-medium — now resolved.
 
-## `fan_duty_avg` truncates integer division
+## `fan_duty_avg` truncates integer division — RESOLVED 2026-06-12
 
-`src/app.rs:39`: `sum / fans.len() as u32` performs integer division after summing `u32` duty percentages. Fractional results are truncated silently. For example, two fans at 41% and 40% yields 40% rather than 40.5% (displayed as 40%). The discrepancy is small but grows with more fans at uneven duties. Fix: compute as `f64` and round, or use `(sum + fans.len() as u32 / 2) / fans.len() as u32` for rounding.
+`fan_duty_avg` and `fan_speed_avg` now round to nearest via `(sum + len/2) / len` rather than truncating. Both have `#[allow(clippy::cast_possible_truncation)]` with justifying in-code comments (the rounded mean of bounded values stays in range).
 
-Severity: low — cosmetic rounding error.
+## `uninstall` recipe leaves metainfo file behind — RESOLVED 2026-06-12
 
-## `uninstall` recipe leaves metainfo file behind
+`just uninstall` now removes `bin-dst`, `desktop-dst`, `appdata-dst`, and `icon-dst`. The install path is `share/metainfo/` (not the former `share/appdata/`) and the `uninstall` recipe removes `appdata-dst` which resolves to the new path.
 
-`justfile:58-60`: `just uninstall` removes `bin-dst`, `desktop-dst`, and `icon-dst` but does not remove `appdata-dst` (`/usr/share/appdata/com.github.cosmix.LiquidMon.metainfo.xml`). AppStream/software-center tooling may continue listing the application after uninstall. Fix: add `rm {{appdata-dst}}` to the uninstall recipe.
+## `tag` recipe does not validate version string format — RESOLVED 2026-06-12
 
-Severity: low — packaging hygiene.
-
-## `tag` recipe does not validate version string format
-
-`justfile:76-82`: `just tag <version>` writes the provided string directly into Cargo.toml via `sed` and creates a git tag. There is no validation that `<version>` is valid semver (e.g., `just tag foo-bar` would mutate Cargo.toml before `cargo check` catches the invalid version). The git commit and Cargo.toml modification happen before `cargo check`. Fix: add a `grep -qP '^\d+\.\d+\.\d+' <<< "{{version}}"` guard at the top of the recipe, or use a dedicated version-bump tool.
-
-Severity: low — developer workflow hazard.
+`just tag <version>` now has a semver guard (`grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'`) at the top of the recipe before any Cargo.toml mutation. An invalid version string exits immediately with an error. The annotated tag message is `Release <version>` (not the bare version string).
 
 ## `libcosmic` pinned to a bare git SHA with no version tag
 
@@ -100,20 +92,52 @@ Severity: low — developer workflow hazard.
 
 Severity: low — maintenance burden; no immediate security risk.
 
-## Subscription channel buffer causes non-uniform poll timing under backpressure
+## Subscription channel buffer causes non-uniform poll timing under backpressure — PARTIALLY MITIGATED
 
-`src/app.rs:278`: the channel created by `cosmic::iced::stream::channel(4, ...)` has a buffer of 4. The async loop sends a message then sleeps `config.sample_interval_ms`. If the UI event loop falls behind (compositor suspended, high CPU load), the send will `.await` until the receiver drains a slot — blocking the sleep timer and causing the effective poll interval to expand unpredictably. A buffer of 1 would make the back-pressure visible immediately; a buffer of 4 silently absorbs backpressure. This is unlikely to matter in practice but should be documented.
+The channel has a buffer of 4. With `tokio::time::interval + MissedTickBehavior::Delay` (added 2026-06-12) the tick-to-tick period is now independent of fetch duration. However, if the UI event loop falls behind (compositor suspended, high CPU load), the `channel.send().await` can still block the ticker for that iteration. The `Delay` policy means the NEXT tick is not burst-scheduled to compensate — it simply fires one full interval after the delayed send completes. Under sustained backpressure the effective sample rate degrades gracefully rather than erratically. Buffer of 4 still silently absorbs up to 4 queued ticks before applying send backpressure.
 
-Severity: informational — timing behaviour under backpressure is not documented.
+Severity: informational — acceptable for an applet; documented here for future reference.
 
-## `vendor` recipe uses GNU-specific `head -n -1`
+## `vendor` recipe uses GNU-specific `head -n -1` — RESOLVED 2026-06-12
 
-`justfile:64`: `cargo vendor ... | head -n -1 > .cargo/config.toml` relies on GNU `head`'s negative-count extension. On BSD/macOS `head`, `-n -1` is an error. Even on Linux, if `cargo vendor` emits zero lines, `head -n -1` produces empty output, silently writing an empty `.cargo/config.toml`. Fix: use `cargo vendor ... > /tmp/vendor-config.toml && sed '$d' /tmp/vendor-config.toml > .cargo/config.toml` (POSIX-safe last-line removal) or parse the config with a purpose-built tool.
+The `vendor` recipe now uses `mktemp` + `sed '$d'` (POSIX-safe last-line removal) instead of `head -n -1`. The recipe is also `bash`-explict (`#!/usr/bin/env bash`) with `set -euo pipefail`. No silent failure mode remains.
 
-Severity: low — affects Linux-only tooling but creates a silent failure mode.
+## No CI workflow files present — RESOLVED 2026-06-12
 
-## No CI workflow files present
+`.github/workflows/ci.yml` and `.github/workflows/release.yml` are present on disk. CI runs two jobs: `check` (fmt → desktop-file-validate → appstreamcli validate → clippy `-D warnings` → test → release build) and `audit` (cargo-audit). The earlier "no automated quality gate" concern is fully resolved.
 
-`.github/workflows/` does not exist in the repository. The git log references `ci.yml` and `release.yml` in a past commit (`6f9b43b ci: add lint/test/build and tag-driven release workflows`), but these files are absent from the working tree. Either they were deleted or were never committed. Without CI, there is no automated gate on `cargo clippy`, `cargo test`, or release artifact builds. Any regression in compilation or test coverage goes undetected until a developer manually runs `just check`.
+## No canvas::Cache in popup equalizers — deferred (m14, 2026-06-12)
 
-Severity: medium — no automated quality gate exists.
+The three popup `Equalizer` canvases and the `Spinner` glyphs do not use `canvas::Cache`. They fully re-tessellate on every `AnimationTick` (~30 fps) while the popup is open. The load is bounded (popup-open only), GPU-composited by the COSMIC compositor, and has not produced measurable frame-drops. Addressing it requires a cross-cutting refactor touching `app.rs`, `equalizer.rs`, and `spinner.rs`. Deferred as marginal; revisit if users report GPU-related issues.
+
+## TEMP_RANGE coolant ceiling at 55 °C may peg near danger zone — deferred (m15, 2026-06-12)
+
+`view::TEMP_RANGE = (20.0, 55.0)` sets the equalizer's absolute hi to 55 °C, which is near the danger zone for many AIO coolers. At 52 °C the amber-to-red transition fires, which is the design intent (absolute, not auto-scaled). The numeric readout always shows the true value. Possible UX refinement: raise hi to 60–65 °C or introduce a distinct "pegged" visual; maintainer's call. Not a bug — intentional absolute-range design.
+
+## VU ramp colors hardcoded at alpha 0.82 — unverified on light COSMIC themes (m16, 2026-06-12)
+
+The equalizer LED cells use a fixed alpha 0.82 for lit cells. On dark COSMIC themes this renders well; on light themes the contrast against the popup background is unverified. A visual check on a light COSMIC theme is needed before declaring the color scheme theme-safe.
+
+## AIO_PATTERNS has no false-positive guard for future non-AIO "hydro"-containing devices (m17, 2026-06-12)
+
+`AIO_PATTERNS` includes `"hydro"` as a substring. There is no false-positive risk in the current liquidctl 1.16.0 catalog (98 devices), but a future non-AIO product using "hydro" in its description could be incorrectly classified as an AIO. Deferred; mitigated by the narrow pattern set and the fact that the dropdown lets users override auto-selection.
+
+## Identical-AIO disambiguation and empty-string fallback in deserialize_string_lossy — deferred (m18/m19, 2026-06-12)
+
+Two identical AIOs connected simultaneously are disambiguated by liquidctl's `--match` on description alone, which is ambiguous. `DetectedDevice` already carries `bus` and `address` for a future `--bus`/`--address` plan. The `deserialize_string_lossy` empty-string fallback for truly-unknown JSON types remains a best-effort safety net; both items deferred pending the `--bus`/`--address` work.
+
+## resources/icon.svg is an empty 128×128 stub (m24, 2026-06-12)
+
+`resources/icon.svg` has no path data. The `.deb` and `just install` both deploy it. `NoDisplay=true` limits user-facing exposure (the icon won't appear in app launchers), but the stub means software-center icon previews will be blank. A real icon is needed before wider distribution.
+
+## Device-family list duplicated across Cargo.toml / README / metainfo (m28, 2026-06-12)
+
+The list of supported AIO families appears in three places. While only one family is supported today, accepting this duplication knowingly; single-source-of-truth cleanup deferred until multi-family support lands.
+
+## Clippy pedantic gate accuracy — important note for future reviewers (2026-06-12)
+
+The ENFORCED quality gate is `cargo clippy --all-targets --all-features -- -D warnings` (default + correctness lints; pedantic NOT included). This is what CI runs and what `just ci-local` mirrors.
+
+`just check` runs `-W clippy::pedantic` WITHOUT `--all-targets` — advisory, non-blocking. Under the full `cargo clippy --all-targets --all-features -- -W clippy::pedantic` command there are ~14 pre-existing pedantic warnings (e.g. `doc_markdown` on type names like `AioStatus`/`AIO_PATTERNS` in doc comments; `too_many_lines` on `update`; `cast_*` on the bounded cast helpers which use justifying in-code comments rather than `#[allow]`s; elidable lifetimes). These are intentionally unfixed; the project is NOT pedantic-clean.
+
+**Rule for future reviewers:** never claim "zero pedantic warnings" without running the exact command `cargo clippy --all-targets --all-features -- -W clippy::pedantic` and reading all output. The `just check` output omits `--all-targets` and therefore misses warnings emitted only in test targets.

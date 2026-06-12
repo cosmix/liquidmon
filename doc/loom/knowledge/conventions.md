@@ -9,8 +9,8 @@
 
 - Structs use `PascalCase`: `AppModel`, `AioStatus`, `Pump`, `Fan`, `Config`, `DeviceEntry`, `StatusEntry`, `Sparkline`
 - Enums use `PascalCase` with descriptive variant names: `Message`, `Error`
-- Error enum variants name their cause: `Spawn(io::Error)`, `Parse(serde_json::Error)`, `NonZeroExit { ... }`, `NoDevice`, `MissingField(&'static str)`, `Timeout`
-- `MissingField` carries a `&'static str` field name (e.g. `"liquid temperature"`) — not a `String` — to avoid allocation and allow direct pattern matching in tests
+- Error enum variants name their cause: `Spawn(io::Error)`, `Parse(serde_json::Error)`, `NonZeroExit { ... }`, `NoDevice`, `MissingField { field: &'static str, device: String }`, `Timeout`
+- `MissingField` is a **struct variant** with two named fields: `field: &'static str` (the missing field name, e.g. `"liquid temperature"` — allocation-free, pattern-matchable in tests) and `device: String` (the device description — built only on the cold error path for self-diagnosing messages)
 - Message variants name the event or action: `TogglePopup`, `PopupClosed`, `UpdateConfig`, `StatusTick`
 
 ### Functions
@@ -27,12 +27,16 @@
 - Result variables named after their purpose, not their type: `label`, `content`, `column`
 - Temp/intermediate: `raw` for raw string output (liquidctl.rs:131), `output` for Command output
 
-### Modules
+### Modules — UPDATED 2026-06-12
 
 - `mod app` — applet model and Elm loop (app.rs)
 - `mod config` — persisted configuration struct (config.rs)
+- `mod devices` — AIO classification helpers (devices.rs)
+- `mod equalizer` — VU-meter canvas widget (equalizer.rs)
 - `mod liquidctl` — subprocess integration (liquidctl.rs)
-- `mod sparkline` — temperature sparkline canvas widget (sparkline.rs)
+- `mod sparkline` — panel button sparkline canvas widget (sparkline.rs)
+- `mod spinner` — animated fan/pump glyph canvas widget (spinner.rs)
+- `mod view` — stateless popup widget builders (view.rs); `pub(crate)` surface
 - All module files are `src/<module>.rs` (flat, no subdirectories)
 
 ### Fields
@@ -136,9 +140,9 @@ const APP_ID = "com.github.<user>.<AppName>"; // RDNN format
 
 ## Async and Import Conventions
 
-### tokio usage
+### tokio usage — UPDATED 2026-06-12
 
-`tokio::process::Command` is used for subprocess execution (liquidctl.rs:9). `tokio::time::sleep` is used for poll delays inside iced stream channels (app.rs:235). `tokio::time::timeout` wraps the subprocess `.output()` call with a 3 s deadline (liquidctl.rs:119). No `#[tokio::main]` — iced/COSMIC owns the async runtime.
+`tokio::process::Command` is used for subprocess execution (liquidctl.rs). `tokio::time::interval` with `MissedTickBehavior::Delay` drives the poll loop inside the iced stream channel (app.rs) — replaces the former `tokio::time::sleep` approach; effective sample period now equals the configured interval regardless of fetch duration. `tokio::time::timeout` wraps the subprocess `.output()` call with a 3 s deadline (liquidctl.rs). `tokio::time::sleep` is still used for the one-shot retry delay in `enumerate_task`. No `#[tokio::main]` — iced/COSMIC owns the async runtime.
 
 ### futures imports
 
@@ -152,9 +156,9 @@ const APP_ID = "com.github.<user>.<AppName>"; // RDNN format
 
 ## Testing Conventions
 
-### Location
+### Location — UPDATED 2026-06-12
 
-Tests are in a `#[cfg(test)] mod tests` block at the bottom of the file containing the function under test. Currently `src/liquidctl.rs` (parser) and `src/app.rs` (helpers + `update` state transitions). No separate test files exist.
+Tests are in a `#[cfg(test)] mod tests` block at the bottom of the file containing the function under test. Files with tests: `src/liquidctl.rs`, `src/app.rs`, `src/view.rs`, `src/equalizer.rs`, `src/sparkline.rs`, `src/devices.rs`, `src/spinner.rs`. No separate test files exist.
 
 ### Test function naming
 
@@ -177,7 +181,8 @@ A `const FIXTURE: &str` at the top of `liquidctl::tests` holds the full JSON str
 ### What is not tested
 
 - Subprocess invocation (`fetch_status`) is not tested — only the pure parsing function (`parse_status_response`) is exercised. No integration tests or mocking of `tokio::process::Command`.
-- `view` / `view_window` rendering, the `subscription` background task, and the `TogglePopup` arm of `update` (which depends on `core.main_window_id()`).
+- `view` / `view_window` rendering (the trait-method entry points in `app.rs`), the `subscription` background task, and the `TogglePopup` arm of `update` (which depends on `core.main_window_id()`).
+- The `view.rs` popup builders themselves (only the pure dropdown helpers are tested; canvas draw methods require an iced renderer).
 
 ## Import Organization
 
@@ -195,15 +200,15 @@ In `liquidctl.rs` (lines 5-9), the order is: `serde`, then `std` modules, then `
 
 Public domain structs derive in this order: `Debug, Clone` (liquidctl.rs:12, 20, 26). The `Config` struct derives `Debug, Default, Clone, CosmicConfigEntry, Eq, PartialEq` (config.rs:5) — standard traits first, then derive-macro traits, then equality traits. `AppModel` derives only `Default` (app.rs:44). `Message` derives `Debug, Clone` (app.rs:61). Private serde structs derive `Debug, Deserialize` (liquidctl.rs:95, 105). The pattern is: `Debug` always first, `Clone` second when present, then domain-specific derives (`Deserialize`, `CosmicConfigEntry`), then equality derives last.
 
-## Visibility Conventions
+## Visibility Conventions — UPDATED 2026-06-12
 
 - `pub struct` for types that cross module boundaries: `AppModel`, `AioStatus`, `Pump`, `Fan`, `Config`, `Sparkline`
 - `pub` fields on domain data structs: all fields of `AioStatus`, `Pump`, `Fan` are `pub`
 - Private structs for internal implementation details: `DeviceEntry`, `StatusEntry` (no `pub`)
-- Private fields on `AppModel`: all six fields are private (no `pub`)
-- `pub async fn` for the public API function: `fetch_status` (liquidctl.rs:115)
-- Private `fn` for implementation helpers: `parse_status_response`, `split_fan_key`, `symbolic_icon`, `fan_duty_avg`
-- No `pub(crate)` is used anywhere in the codebase — the choice is strictly `pub` or private.
+- Private fields on `AppModel`: all fields are private (no `pub`)
+- `pub async fn` for the public API function: `fetch_status` (liquidctl.rs)
+- Private `fn` for implementation helpers: `parse_status_response`, `split_fan_key`, `fan_duty_avg`
+- **`pub(crate)` IS now used in `src/view.rs`** — supersedes the earlier "no `pub(crate)` anywhere" observation. The view module exposes all its builders as `pub(crate)` to give `app.rs` access while keeping them invisible outside the crate. This is the first and currently only use of `pub(crate)` in the codebase. The deviation from the previously all-or-nothing `pub` / private rule is justified: the view builders are crate-internal API, not a public contract. Helpers in `app.rs` itself (`fan_duty_avg`, `push_capped`, `enumerate_task`) remain private `fn`.
 
 ## Clippy and Lint Configuration
 

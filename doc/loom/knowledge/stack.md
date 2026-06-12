@@ -38,7 +38,7 @@ Serialization framework. Used to derive `Deserialize` on `DeviceEntry` and `Stat
 
 ### `serde_json` v1.0.149
 
-JSON parsing. Used in `liquidctl.rs:143` to deserialize the raw liquidctl `--json status` output into `Vec<DeviceEntry>`. Also the type of `StatusEntry::value` (`serde_json::Number`, `liquidctl.rs:108`).
+JSON parsing. Used in `liquidctl.rs` to deserialize the raw liquidctl `--json status` output into `Vec<DeviceEntry>`. `StatusEntry::value` is typed as `serde_json::Value` (not `serde_json::Number`) — this allows non-numeric status entries (strings, booleans) to deserialize successfully and be silently skipped via the `as_f64()` guard rather than failing the entire parse.
 
 ### `futures-util` v0.3.31
 
@@ -71,11 +71,11 @@ Task runner. Key targets:
 - `tag <version>` — bumps `Cargo.toml` version, commits, and creates a git tag
 - `clean` / `clean-vendor` / `clean-dist` — cleanup targets
 
-## Install Paths (justfile)
+## Install Paths (justfile) — UPDATED 2026-06-12
 
 Binary: `/usr/bin/liquidmon`
 Desktop file: `/usr/share/applications/com.github.cosmix.LiquidMon.desktop`
-Metainfo: `/usr/share/appdata/com.github.cosmix.LiquidMon.metainfo.xml`
+Metainfo: `/usr/share/metainfo/com.github.cosmix.LiquidMon.metainfo.xml` (NOT `share/appdata/`)
 Icon: `/usr/share/icons/hicolor/scalable/apps/com.github.cosmix.LiquidMon.svg`
 
 ## Resources
@@ -94,32 +94,29 @@ The applet is registered with the COSMIC panel via the `.desktop` file:
 - App ID `com.github.cosmix.LiquidMon` must match `APP_ID` in `app.rs:81`
 - The COSMIC panel reads installed `.desktop` files from `/usr/share/applications/` to enumerate available applets
 
-## CI Workflow (.github/workflows/ci.yml)
+## CI Workflow (.github/workflows/ci.yml) — UPDATED 2026-06-12
 
-Defined in commit 6f9b43b but NOT currently present on disk (workflows were committed then the directory was removed/untracked — the file exists only in git history at `git show 6f9b43b:.github/workflows/ci.yml`).
+Present on disk (NOT only in git history — the earlier "git history only" claim was stale).
 
 **Triggers:** push to `main`, all pull_requests (with concurrency cancel-in-progress for PRs)
 
 **Runner:** ubuntu-24.04
 
-**Rust toolchain:** `dtolnay/rust-toolchain@stable` — no pinned version; always uses latest stable. Components: `rustfmt`, `clippy`.
-
-**Caching:** `Swatinem/rust-cache@v2`
-
-**System deps installed:** `pkg-config`, `libxkbcommon-dev`, `libwayland-dev`, `libfontconfig1-dev`, `libfreetype6-dev`
+**Rust toolchain:** `dtolnay/rust-toolchain@stable` — intentionally mutable ref (not SHA-pinned; commented). Third-party actions (`actions/checkout`, `Swatinem/rust-cache`) pinned to SHA.
 
 **RUSTFLAGS:** `-D warnings` (global env, makes all warnings errors)
 
-**Steps (single job `check`):**
+**Two jobs:**
 
-1. `cargo fmt --all -- --check`
-2. `cargo clippy --all-targets --all-features -- -D warnings`
-3. `cargo test --all-features --no-fail-fast`
-4. `cargo build --release`
+Job `check` — system deps (adds `desktop-file-utils` and `appstream`) → `desktop-file-validate` → `appstreamcli validate --no-net` → fmt → clippy `-D warnings` → test → release build
 
-## Release Workflow (.github/workflows/release.yml)
+Job `audit` — `cargo install cargo-audit --locked` → `cargo audit`
 
-Also in git history only (same commit 6f9b43b). Trigger: push of tags matching `v*`.
+## Release Workflow (.github/workflows/release.yml) — UPDATED 2026-06-12
+
+Present on disk. Trigger: push of tags matching `v*`.
+
+**Version guard:** `cargo metadata` checks that Cargo.toml version equals the tag (without `v` prefix). Fails the job before any build if mismatched.
 
 **Permissions:** `contents: write` (to create GitHub releases)
 
@@ -127,14 +124,14 @@ Also in git history only (same commit 6f9b43b). Trigger: push of tags matching `
 
 - Stripped release binary via `cargo build --release --locked`
 - `.deb` package via `cargo-deb` (`cargo install cargo-deb --locked`, then `cargo deb --no-build --no-strip`)
-- Source tarball: `liquidmon-<version>-x86_64-linux.tar.gz` containing binary + `resources/` + `justfile` + `README.md`
+- Source tarball: `liquidmon-<version>-x86_64-linux.tar.gz` containing binary + `resources/` + `README.md` (no `justfile`)
 - `SHA256SUMS` file covering both `.tar.gz` and `.deb`
 
 **Tarball naming:** `liquidmon-${version}-x86_64-linux.tar.gz` where version strips the `v` prefix from the git tag
 
-**Upload:** `softprops/action-gh-release@v2` with `generate_release_notes: true`
+**Upload:** `softprops/action-gh-release` (SHA-pinned) with `generate_release_notes: true` and `fail_on_unmatched_files: true`
 
-**Deb verification step:** installs with `dpkg -i`, checks `dpkg -L`, verifies binary in PATH, then removes — ensures the package is installable before release.
+**Deb verification step:** `sudo apt-get install -y ./target/debian/*.deb`, `dpkg -L liquidmon`, `command -v liquidmon`, `sudo apt-get remove -y liquidmon` — uses `apt-get install` (resolves `liquidctl` dep) rather than bare `dpkg -i`.
 
 ## Cargo.toml — Complete Structure
 
@@ -176,9 +173,7 @@ No `rust-toolchain.toml`, `.rustfmt.toml`, or `clippy.toml` exist in the reposit
 
 `resources/icon.svg` — the main app icon installed to `hicolor/scalable/apps/com.github.cosmix.LiquidMon.svg`
 
-## Justfile — Complete Target List
-
-All targets (none were undocumented beyond what was known):
+## Justfile — Complete Target List — UPDATED 2026-06-12
 
 - `default` → alias for `build-release`
 - `clean` — `cargo clean`
@@ -187,11 +182,14 @@ All targets (none were undocumented beyond what was known):
 - `build-debug *args` — `cargo build {{args}}`
 - `build-release *args` — calls `build-debug '--release' args`
 - `build-vendored *args` — `vendor-extract` + `build-release '--frozen --offline' args`
-- `check *args` — `cargo clippy --all-features` with `-W clippy::pedantic`
+- `check *args` — `cargo clippy --all-features {{args}} -- -W clippy::pedantic` (advisory; NOT `-D warnings`)
 - `check-json` — `check '--message-format=json'`
+- `ci-local` — mirrors CI exactly: fmt + clippy `-D warnings` + test + release build
+- `audit` — `cargo audit`
+- `hooks` — installs git hooks from `.githooks/install.sh`
 - `run *args` — `RUST_BACKTRACE=full cargo run --release`
-- `install` — installs binary (0755), desktop, metainfo (0644), icon (0644)
-- `uninstall` — removes binary, desktop, icon
-- `vendor` — vendors deps into `vendor.tar` + `.cargo/config.toml` patch
+- `install` — installs binary (0755), desktop, metainfo to `share/metainfo/` (0644), icon (0644)
+- `uninstall` — removes binary, desktop, metainfo, and icon (all four paths)
+- `vendor` — POSIX-safe: `mktemp` + `sed '$d'`; produces `vendor.tar`
 - `vendor-extract` — unpacks `vendor.tar`
-- `tag <version>` — bumps version in all Cargo.toml files via `sed`, does `cargo check` + `cargo clean`, commits with `release: <version>`, creates annotated git tag
+- `tag <version>` — semver guard → sed-patches Cargo.toml → `cargo check` + `cargo clean` → commit `release: <version>` → annotated tag `v<version>` with message `Release <version>`

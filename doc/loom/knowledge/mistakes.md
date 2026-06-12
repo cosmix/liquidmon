@@ -29,3 +29,16 @@
 - Extract the math helper (e.g. `y_range`) as a pure function so the scaling behavior is unit-testable without an iced renderer. Six tests on the new `y_range` would have caught the original silent-clipping bug at design time.
 
 **Fix:** Replaced fixed range with `y_range(&[f64]) -> (f64, f64)` auto-scaling helper with a `MIN_Y_SPAN = 2.0` °C floor (centered on midpoint) to prevent noise amplification on flat traces. Single-sample case now renders a horizontal tick across the canvas at the sample's y. Six unit tests added for `y_range`.
+
+## Claiming "zero pedantic warnings" without running the full command (2026-06-12)
+
+**What happened:** A code review asserted "zero `-W clippy::pedantic` warnings" based on `just check` output. `just check` runs `cargo clippy --all-features -- -W clippy::pedantic` (no `--all-targets`). The full command `cargo clippy --all-targets --all-features -- -W clippy::pedantic` surfaces ~14 pre-existing pedantic warnings (e.g. `doc_markdown` on type names in doc comments, `too_many_lines` on `update`, `cast_*` on bounded cast helpers with justifying in-code comments). The review claim was inaccurate.
+
+**Why:** The `just check` invocation omits `--all-targets`, which excludes test targets from linting. Pedantic warnings in test code (and in code only reachable through tests) are invisible without `--all-targets`.
+
+**Prevention:**
+- Always run the EXACT command being asserted, including all flags, before claiming a lint gate is clean.
+- `just check` ≠ `just ci-local` ≠ the full pedantic command. Know which gate you're checking.
+- Background subagents cannot answer permission prompts interactively, so lint verification commands must run in a foreground/main-agent context where prompts can be accepted.
+
+**Detection heuristic:** if a lint claim says "clean" but `just check` was the only evidence, re-run `cargo clippy --all-targets --all-features -- -W clippy::pedantic` and count warnings before asserting.

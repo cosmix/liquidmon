@@ -22,26 +22,29 @@ scripts/
 src/
 ```
 
-## Module Dependency Graph
+## Module Dependency Graph — UPDATED 2026-06-12
 
 ```text
-main.rs
+main.rs  (14 lines)
   ├── mod config    (config.rs)
   ├── mod devices   (devices.rs)
+  ├── mod equalizer (equalizer.rs)
   ├── mod liquidctl (liquidctl.rs)
   ├── mod sparkline (sparkline.rs)
-  ├── mod equalizer (equalizer.rs)
   ├── mod spinner   (spinner.rs)
+  ├── mod view      (view.rs)      ← NEW module added 2026-06-12
   └── mod app       (app.rs)
         ├── uses crate::config::Config
         ├── uses crate::liquidctl::{AioStatus, DetectedDevice, list_devices, fetch_status}
         ├── uses crate::devices::{filter_aios, auto_select}
         ├── uses crate::sparkline::{Sparkline, SparklineTint}   (panel button only)
-        ├── uses crate::equalizer::Equalizer                    (popup metric blocks)
-        └── uses crate::spinner::{Spinner, Kind}                (popup fan/pump glyphs)
+        ├── uses crate::spinner::Kind                           (popup spinner glyphs via view)
+        └── uses crate::view                                    (popup builders; pub(crate) surface)
 ```
 
-`main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the only consumer of `config`, `liquidctl`, `devices`, and `sparkline`. The `devices` module depends only on `liquidctl::DetectedDevice`.
+`main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the primary consumer of `config`, `liquidctl`, `devices`, and `view`. The `view` module owns the popup widget builders; `equalizer`, `spinner`, and `sparkline` are consumed by `view` (and directly by `app` for the panel button sparkline). The `devices` module depends only on `liquidctl::DetectedDevice`.
+
+**8 source modules total:** `app`, `config`, `devices`, `equalizer`, `liquidctl`, `sparkline`, `spinner`, `view`.
 
 ## COSMIC Applet Framework Integration
 
@@ -56,9 +59,9 @@ main.rs
 
 Panel button is rendered by `view()` (src/app.rs:120-165); popup overlay by `view_window()` (src/app.rs:170-213). Both are called by the framework on each frame.
 
-## AppModel State Structure
+## AppModel State Structure — UPDATED 2026-06-12
 
-`src/app.rs:87-115`
+`src/app.rs:92-132`
 
 ```text
 AppModel {
@@ -66,64 +69,79 @@ AppModel {
     popup:                 Option<Id>             // Some(id) when popup is open
     config:                Config                 // Persisted config (cosmic_config) — v3
     config_handle:         Option<cosmic_config::Config>  // kept alive for write_entry
-    pending_interval_secs: Option<f32>            // slider drag value (None outside drag)
+    pending_interval_secs: Option<f32>            // slider drag value (None outside drag); cleared on popup close
     last_status:           Option<AioStatus>      // Most-recent successful liquidctl read
     last_error:            Option<String>         // Most-recent error (kept even with stale data)
     temp_history:          VecDeque<f64>          // Liquid temp samples (cap: HISTORY_CAP=900)
-    pump_duty_history:     VecDeque<f64>          // Pump duty % samples (popup sparkline)
-    fan_avg_duty_history:  VecDeque<f64>          // Mean fan duty % (popup sparkline)
+    pump_duty_history:     VecDeque<f64>          // Pump duty % samples (popup equalizer)
+    fan_avg_duty_history:  VecDeque<f64>          // Mean fan duty % (popup equalizer)
     detected_devices:      Vec<DetectedDevice>    // Latest liquidctl list enumeration
     device_scan_in_flight: bool                   // True while a list_devices Task is in flight
+    anim_t:                f32                    // Popup animation clock (seconds); advances only while popup is open
+    enumeration_retried:   bool                   // Guards one-shot re-enumeration retry after initial failure
 }
 ```
 
-The popup renders three large 80 px sparklines (coolant temperature, pump duty, fan-average duty); pump speed and per-fan speed are surfaced as numeric labels next to the matching sparkline rather than as separate canvases.
+The popup renders three 64 px VU-meter equalizer canvases (coolant temperature, pump duty, fan-average duty). Pump speed and per-fan speed are surfaced as numeric labels in metric-block headers rather than as separate canvases.
 
-Constants at `src/app.rs:21-24`:
+Constants at `src/app.rs:25-33`:
 
 ```text
-PANEL_SPARK_SAMPLES = 60    — trailing-N window fed to the panel button sparkline
-HISTORY_CAP         = 900   — maximum samples in every per-metric VecDeque (~15 min at 1 s)
-MIN_INTERVAL_MS     = 1000  — lower bound for the user-configurable sample interval
-MAX_INTERVAL_MS     = 10000 — upper bound for the user-configurable sample interval
+PANEL_SPARK_SAMPLES = 60             — trailing-N window fed to the panel button sparkline
+HISTORY_CAP         = 900            — maximum samples in every per-metric VecDeque (~15 min at 1 s)
+MIN_INTERVAL_MS     = 1000           — lower bound for the user-configurable sample interval
+MAX_INTERVAL_MS     = 10000          — upper bound for the user-configurable sample interval
+ANIM_INTERVAL       = Duration(33ms) — drives both the iced `every(...)` subscription and the per-tick anim_t advance
 ```
 
-On a poll error, `last_status` is intentionally NOT cleared (src/app.rs:332-334), so the UI can show stale readings alongside the error badge.
+On a poll error, `last_status` is intentionally NOT cleared, so the UI can show stale readings alongside the error badge.
 
-## Message/Event Types and Flow
+## Message/Event Types and Flow — UPDATED 2026-06-12
 
-Defined at `src/app.rs:121-130`:
+Defined at `src/app.rs:136-156`:
 
 ```text
 Message::TogglePopup             — panel button click → open/close popup window
 Message::PopupClosed(Id)         — Wayland compositor closed popup externally
 Message::UpdateConfig(Config)    — cosmic_config watch fired a new config value
-Message::StatusTick(Result<AioStatus, String>)
-                                 — background subscription delivered a liquidctl result
+Message::StatusTick { match_str: String, result: Result<AioStatus, String> }
+                                 — background subscription delivered a liquidctl result;
+                                   carries the match string so late results from old
+                                   subscriptions are dropped if the device changed
 Message::SampleIntervalDragged(f32)
                                  — fires every drag tick; updates pending_interval_secs only
 Message::SampleIntervalReleased  — fires once on slider release; commits and persists the interval
+Message::DevicesEnumerated(Result<Vec<DetectedDevice>, String>)
+                                 — result of a liquidctl list --json enumeration
+Message::DeviceSelected(Option<String>)
+                                 — user chose a device from the popup dropdown
+Message::AnimationTick           — 33 ms timer; advances anim_t while popup is open
 ```
 
-All messages route through `AppModel::update` (src/app.rs:253-302):
+All messages route through `AppModel::update` (src/app.rs:372+):
 
-- `StatusTick(Ok)` → appends temp to `temp_history`, writes `last_status`, clears `last_error`
-- `StatusTick(Err)` → writes `last_error`, preserves stale `last_status`
-- `UpdateConfig` → replaces `self.config`
-- `TogglePopup` → returns a `Task` (get_popup or destroy_popup), updates `self.popup`
-- `PopupClosed` → clears `self.popup` if IDs match
+- `StatusTick{Ok}` → appends to `temp_history`/`pump_duty_history`/`fan_avg_duty_history`, writes `last_status`, clears `last_error`
+- `StatusTick{Err}` → writes `last_error`, preserves stale `last_status`
+- `UpdateConfig` → replaces `self.config`; resets device state if effective match changed
+- `TogglePopup` → returns a `Task` (get_popup or destroy_popup), updates `self.popup`; also clears `pending_interval_secs` on close
+- `PopupClosed` → clears `self.popup` and `pending_interval_secs` if IDs match
+- `DevicesEnumerated(Ok)` → snapshots detected devices; on first failure with no known device fires one bounded delayed retry
+- `DeviceSelected` → short-circuits on semantic no-ops; resets device state if effective match changed
+- `AnimationTick` → advances `anim_t` by `ANIM_INTERVAL`
 
-## Data Flow: liquidctl subprocess → UI
+## Data Flow: liquidctl subprocess → UI — UPDATED 2026-06-12
 
 ```text
-Subscription::run_with(interval_ms, …)    [src/app.rs:276]
-  └─ infinite async loop every config.sample_interval_ms (default 1500 ms)
-       └─ liquidctl::fetch_status("Hydro")     [src/liquidctl.rs:115]
+Subscription::run_with((interval_ms, match_str), …)    [src/app.rs:319]
+  └─ tokio::time::interval + MissedTickBehavior::Delay
+       (tick fires at the TOP of the loop so the period equals the configured
+        interval regardless of fetch duration; first tick resolves immediately)
+       └─ liquidctl::fetch_status(match_str)     [src/liquidctl.rs:132]
             └─ tokio::process::Command::new("liquidctl")
-                 .args(["--match", "Hydro", "--json", "status"])
+                 .args(["--match", match_str, "--json", "status"])
                  .kill_on_drop(true)
                  .output() — wrapped in tokio::time::timeout(3s)
-            └─ parse_status_response(raw)      [src/liquidctl.rs:142]
+            └─ parse_status_response(raw)      [src/liquidctl.rs:164]
                  └─ serde_json::from_str → Vec<DeviceEntry>
                       └─ find first device with non-empty status
                       └─ scan StatusEntry vec for known keys
@@ -132,9 +150,9 @@ Subscription::run_with(interval_ms, …)    [src/app.rs:276]
                            "Pump duty"         → pump.duty_pct: u8
                            "Fan N speed/duty"  → fans[N].{speed_rpm,duty_pct}
                       └─ return AioStatus
-  └─ channel.send(Message::StatusTick(result))
-       └─ AppModel::update receives StatusTick
-            └─ temp_history updated; AppModel.last_status updated
+  └─ channel.send(Message::StatusTick { match_str, result })
+       └─ AppModel::update receives StatusTick; drops if match_str ≠ effective_match()
+            └─ histories updated; AppModel.last_status updated
                  └─ framework re-renders view() / view_window()
 ```
 
@@ -181,19 +199,21 @@ Raw JSON schema:
   bus: String
   address: String
   description: String
-  status: [StatusEntry { key: String, value: Number, unit: String }]
+  status: [StatusEntry { key: String, value: serde_json::Value, unit: String }]
 ```
+
+`StatusEntry.value` is typed as `serde_json::Value` (not `serde_json::Number`) so that a string/bool/null value deserializes successfully and the `as_f64()` guard at the loop site silently skips it rather than failing the entire device parse. See "StatusEntry.value type — RESOLVED 2026-06-12" in concerns.md.
 
 Fan parsing: keys matching `"Fan N speed"` / `"Fan N duty"` are accumulated into a `BTreeMap<u8, (Option<u32>, Option<u8>)>` keyed by fan index, then flattened to `Vec<Fan>` sorted by index (`src/liquidctl.rs:158-201`). Index 0 is explicitly rejected by `split_fan_key` (`src/liquidctl.rs:219-221`).
 
-Error hierarchy (`src/liquidctl.rs:33-44`):
+Error hierarchy (`src/liquidctl.rs:52-60`) — UPDATED 2026-06-12:
 
-- `Error::Spawn(io::Error)` — process could not start
-- `Error::NonZeroExit { status, stderr }` — liquidctl returned non-zero
+- `Error::Spawn(io::Error)` — process could not start; `Display` now gives a PATH/install hint when `kind() == NotFound`
+- `Error::NonZeroExit { status, stderr }` — liquidctl returned non-zero; `stderr` is truncated to last 4 lines via `last_lines` helper
 - `Error::Parse(serde_json::Error)` — JSON malformed
 - `Error::NoDevice` — no device matched or no device with non-empty status
-- `Error::MissingField(&'static str)` — device found but a required field (liquid temperature, pump speed, pump duty) is absent
-- `Error::Timeout` — `tokio::time::timeout(3s)` elapsed before the subprocess completed
+- `Error::MissingField { field: &'static str, device: String }` — device found but a required field absent; `field` is `&'static str` (allocation-free matching in tests); `device` is a `String` built only on the cold error path for self-diagnosing messages
+- `Error::Timeout` — `tokio::time::timeout(3s)` elapsed (clocks only AFTER `LIQUIDCTL_LOCK` is acquired; lock-wait time does not count)
 
 ## Configuration System
 
@@ -211,11 +231,11 @@ Config is loaded in `AppModel::init` (`src/app.rs:161-168`) by constructing a si
 
 APP_ID: `"com.github.cosmix.LiquidMon"` (`src/app.rs:81`)
 
-## View Rendering Logic
+## View Rendering Logic — UPDATED 2026-06-12
 
-Panel button (`view`, src/app.rs:120-165): when `last_status` is present, renders a horizontal `row` of:
+Panel button (`view`, src/app.rs): when `last_status` is present, renders a horizontal `row` of:
 
-- Snowflake + temperature icon (symbolic SVGs)
+- Snowflake + temperature icon (symbolic SVGs, consts now in `view.rs`)
 - Temperature text (e.g. `"30.1°"`)
 - Sparkline canvas (36×16 px, 60 samples of `temp_history`)
 - Fan icon + average fan duty% text
@@ -223,11 +243,13 @@ Panel button (`view`, src/app.rs:120-165): when `last_status` is present, render
 
 On error with no status: `"!"`. Neither: `"…"` (waiting for first reading).
 
-Popup (`view_window`, src/app.rs:170-213): three-way match on `(last_status, last_error)`:
+Popup (`view_window`, src/app.rs): three-way match on `(last_status, last_error)`:
 
-- Status + maybe error → `list_column` with heading (device description), liquid temp body, pump body, one body per fan, optional error caption
+- Status + maybe error → calls `self.popup_metrics_view(status, maybe_err.as_deref())`
 - No status + error → heading "liquidctl error" + error body
 - Neither → "Waiting for first reading…"
+
+`popup_metrics_view` is a thin orchestrator in `app.rs` that reads private `AppModel` fields (`anim_t`, `temp_history`, etc.) and threads plain data into `view::*` builders. The builders themselves are in `src/view.rs` and do not borrow `AppModel`.
 
 ## Build and Install
 
@@ -257,44 +279,57 @@ The path `liquidctl subprocess → AioStatus → last_status → view` has one s
 
 The stale-data preservation design is intentional and correct — users see recent data with an error badge rather than a blank panel.
 
-### Module Responsibility Summary
+### Module Responsibility Summary — UPDATED 2026-06-12
 
-| Module         | Responsibility                                     | External I/O                          |
-| -------------- | -------------------------------------------------- | ------------------------------------- |
-| `main.rs`      | Binary entry, framework launch                     | None                                  |
-| `app.rs`       | AppModel, all message handling, all view rendering | libcosmic IPC, Wayland popup commands |
-| `liquidctl.rs` | Subprocess invocation and JSON parsing             | `liquidctl` process via stdin/stdout  |
-| `sparkline.rs` | Iced Canvas widget for temperature sparkline       | None                                  |
-| `config.rs`    | Config schema declaration only                     | cosmic-config/dbus (via libcosmic)    |
+| Module         | Responsibility                                                    | External I/O                          |
+| -------------- | ----------------------------------------------------------------- | ------------------------------------- |
+| `main.rs`      | Binary entry, framework launch                                    | None                                  |
+| `app.rs`       | AppModel, all message handling, `view()`/`view_window()` trait methods, `popup_metrics_view` orchestrator | libcosmic IPC, Wayland popup commands |
+| `view.rs`      | Stateless popup widget builders; `pub(crate)` surface; owns `ICON_*` consts, `TEMP_RANGE`/`DUTY_RANGE`, all popup-layer helpers | None |
+| `liquidctl.rs` | Subprocess invocation and JSON parsing                            | `liquidctl` process via stdin/stdout  |
+| `sparkline.rs` | Iced Canvas widget for panel-button temperature sparkline         | None                                  |
+| `equalizer.rs` | Iced Canvas VU-meter widget for popup metric histories            | None                                  |
+| `spinner.rs`   | Iced Canvas animated fan/pump glyph widget                        | None                                  |
+| `config.rs`    | Config schema declaration only                                    | cosmic-config/dbus (via libcosmic)    |
 
-## CI/CD Pipeline
+## CI/CD Pipeline — UPDATED 2026-06-12
 
-`.github/workflows/ci.yml` — triggered on every push to `main` and every pull request. Concurrency group cancels in-progress PR runs on new pushes (`cancel-in-progress: ${{ github.event_name == 'pull_request' }}`). Runs on `ubuntu-24.04`.
+`.github/workflows/ci.yml` — present on disk (NOT only in git history; earlier entries claiming otherwise are superseded). Triggered on every push to `main` and every pull request. Concurrency group cancels in-progress PR runs on new pushes (`cancel-in-progress: ${{ github.event_name == 'pull_request' }}`). Runs on `ubuntu-24.04`. Third-party actions pinned to commit SHAs (`actions/checkout`, `Swatinem/rust-cache`); `dtolnay/rust-toolchain@stable` intentionally left as a mutable ref (commented).
 
-Single job `check` (fmt / clippy / test / build):
+**Two jobs:**
 
-1. Install system deps: `pkg-config`, `libxkbcommon-dev`, `libwayland-dev`, `libfontconfig1-dev`, `libfreetype6-dev`
-2. `dtolnay/rust-toolchain@stable` with `rustfmt` and `clippy` components
-3. `Swatinem/rust-cache@v2` for dependency caching
-4. `cargo fmt --all -- --check`
-5. `cargo clippy --all-targets --all-features -- -D warnings` (all warnings are errors via `RUSTFLAGS: -D warnings`)
-6. `cargo test --all-features --no-fail-fast`
-7. `cargo build --release`
+Job `check` (fmt / validate / clippy / test / build):
 
-## Release Workflow
+1. Install system deps: `pkg-config`, `libxkbcommon-dev`, `libwayland-dev`, `libfontconfig1-dev`, `libfreetype6-dev`, `desktop-file-utils`, `appstream`
+2. `desktop-file-validate resources/app.desktop`
+3. `appstreamcli validate --no-net resources/app.metainfo.xml`
+4. `dtolnay/rust-toolchain@stable` with `rustfmt` and `clippy` components
+5. `Swatinem/rust-cache` (SHA-pinned) for dependency caching
+6. `cargo fmt --all -- --check`
+7. `cargo clippy --all-targets --all-features -- -D warnings` (all warnings are errors via `RUSTFLAGS: -D warnings`)
+8. `cargo test --all-features --no-fail-fast`
+9. `cargo build --release`
 
-`.github/workflows/release.yml` — triggered on `v*` tag pushes. Requires `permissions: contents: write` for GitHub release creation.
+Job `audit` (separate job):
+
+1. `cargo install cargo-audit --locked`
+2. `cargo audit`
+
+## Release Workflow — UPDATED 2026-06-12
+
+`.github/workflows/release.yml` — present on disk. Triggered on `v*` tag pushes. Requires `permissions: contents: write`.
 
 Single job `build` (.deb + tarball):
 
-1. Same system deps + toolchain + cache as CI
-2. `cargo install cargo-deb --locked` — installs the Debian packager
-3. `cargo build --release --locked` then `strip target/release/liquidmon`
-4. `cargo deb --no-build --no-strip` — generates `.deb` from `[package.metadata.deb]` in `Cargo.toml`
-5. Smoke-test: `sudo dpkg -i target/debian/*.deb`, `dpkg -L liquidmon`, `command -v liquidmon`, `sudo dpkg -r liquidmon`
-6. Tarball: strips `v` from tag → `liquidmon-<version>-x86_64-linux/` with binary + `resources/` + `justfile` + `README.md`, then `tar -czf`
-7. `sha256sum *.tar.gz *.deb > SHA256SUMS`
-8. `softprops/action-gh-release@v2` uploads `.tar.gz`, `.deb`, `SHA256SUMS`; sets `generate_release_notes: true`
+1. Verify Cargo.toml version matches tag (guard: `cargo metadata` vs `GITHUB_REF_NAME`)
+2. Same system deps + toolchain + cache as CI (minus desktop-file-utils/appstream)
+3. `cargo install cargo-deb --locked`
+4. `cargo build --release --locked` then `strip target/release/liquidmon`
+5. `cargo deb --no-build --no-strip`
+6. Smoke-test: `sudo apt-get install -y ./target/debian/*.deb`, `dpkg -L liquidmon`, `command -v liquidmon`, `sudo apt-get remove -y liquidmon`
+7. Tarball: strips `v` from tag → `liquidmon-<version>-x86_64-linux/` with binary + `resources/` + `README.md` (no `justfile` in tarball)
+8. `sha256sum *.tar.gz *.deb > SHA256SUMS`
+9. `softprops/action-gh-release` (SHA-pinned) uploads `.tar.gz`, `.deb`, `SHA256SUMS`; sets `generate_release_notes: true` and `fail_on_unmatched_files: true`
 
 ## cargo-deb Integration (Cargo.toml)
 
@@ -303,7 +338,7 @@ Single job `build` (.deb + tarball):
 - `maintainer`, `section = "utility"`, `priority = "optional"`
 - `depends = "$auto, liquidctl"` — auto-detects Rust runtime deps and adds explicit `liquidctl` dep
 - `extended-description` explaining udev rule requirement
-- `assets` array maps: binary→`usr/bin/`, desktop→`usr/share/applications/`, metainfo→`usr/share/appdata/`, icon→`usr/share/icons/hicolor/scalable/apps/`, `README.md`→`usr/share/doc/liquidmon/README`
+- `assets` array maps: binary→`usr/bin/`, desktop→`usr/share/applications/`, metainfo→`usr/share/metainfo/`, icon→`usr/share/icons/hicolor/scalable/apps/`, `README.md`→`usr/share/doc/liquidmon/README`
 
 ## libcosmic Dependency Pinning
 
@@ -322,7 +357,7 @@ Single job `build` (.deb + tarball):
 - `X-CosmicHoverPopup=Auto` — controls hover popup behavior in the COSMIC panel
 - `StartupNotify=true`, `Terminal=false`, `Categories=COSMIC`, `MimeType=` (explicitly empty)
 
-## AppStream Metadata
+## AppStream Metadata — UPDATED 2026-06-12
 
 `resources/app.metainfo.xml` (AppStream/Flathub standard):
 
@@ -331,25 +366,33 @@ Single job `build` (.deb + tarball):
 - `<requires><display_length compare="ge">360</display_length></requires>` — minimum display width
 - `<supports>`: keyboard, pointing, touch controls
 - `<content_rating type="oars-1.1" />` — OARS content rating (empty = no objectionable content)
-- `<provides><binaries><binary>liquidmon</binary></binaries></provides>`
+- `<provides><binary>liquidmon</binary></provides>`
+- `<releases>` element present with entries for 0.3.0, 0.2.2, 0.2.1, 0.1.4, 0.1.2, 0.1.0
+- `<categories>`: System, Monitor
+- `<developer id="com.github.cosmix"><name>Dimosthenis Kaponis</name></developer>`
 
 ## Icon
 
 `resources/icon.svg` is a stub: a 128×128 empty `<svg>` element with no path data (2 lines). The four symbolic panel icons (`fan-symbolic.svg`, `pump-symbolic.svg`, `snowflake-symbolic.svg`, `temperature-symbolic.svg`) live under `resources/icons/` and are what actually appear in the panel UI.
 
-## Justfile Additional Targets
+## Justfile Additional Targets — UPDATED 2026-06-12
 
-Targets not previously documented:
+Targets and notable changes:
 
 - `clean` — `cargo clean`
 - `clean-vendor` — removes `.cargo/` and `vendor/` and `vendor.tar`
 - `clean-dist` — runs both `clean` and `clean-vendor`
 - `build-debug *args` — `cargo build` (debug profile)
+- `check *args` — `cargo clippy --all-features {{args}} -- -W clippy::pedantic` (pedantic warnings, NOT `-D warnings`; non-blocking local lint)
 - `check-json` — runs clippy with `--message-format=json` (for editor tooling)
-- `uninstall` — removes binary, desktop, and icon from installed paths (does NOT remove metainfo)
-- `vendor` — runs `cargo vendor`, pipes source replacement config into `.cargo/config.toml`, archives everything into `vendor.tar`, then removes `.cargo/` and `vendor/` (the archive is the artifact)
+- `ci-local` — mirrors CI exactly: `cargo fmt --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo test` + `cargo build --release`
+- `audit` — `cargo audit`
+- `hooks` — installs git hooks from `.githooks/install.sh`
+- `uninstall` — removes binary, desktop, metainfo, and icon from installed paths (now removes `appdata-dst` too — RESOLVED 2026-06-12)
+- `vendor` — POSIX-safe: uses `mktemp` + `sed '$d'` instead of `head -n -1`; archives into `vendor.tar`; removes intermediates (RESOLVED 2026-06-12)
 - `vendor-extract` — extracts `vendor.tar` back to `vendor/` and `.cargo/`
-- `tag <version>` — sed-patches all `Cargo.toml` `version =` lines, runs `cargo check` + `cargo clean`, stages `Cargo.lock`, creates a `release: <version>` commit, and creates an annotated git tag
+- `tag <version>` — has semver guard (`grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'`) before patching; creates annotated tag `v<version>` with message `Release <version>` (RESOLVED 2026-06-12)
+- `install` — metainfo installs to `share/metainfo/` (not `share/appdata/`)
 
 ## doc/plans Directory
 
@@ -386,33 +429,20 @@ Edge-case behavior:
 - Single sample: `draw` (`src/sparkline.rs:90-100`) renders a horizontal tick at the sample's y across the full canvas width, so the sparkline is visible immediately after the first poll instead of waiting for a second reading.
 - Two or more samples: standard polyline.
 
-## Icon Situation: Stub vs. Symbolic Set
+## Icon Situation: Stub vs. Symbolic Set — UPDATED 2026-06-12
 
 - `resources/icon.svg` — the application icon installed to `hicolor/scalable/apps/`. Currently an empty 128×128 SVG stub with no paths. The `.deb` and `just install` both deploy it.
-- `resources/icons/` — four symbolic SVGs actually used in the panel UI, embedded via `include_bytes\!`:
-  - `fan-symbolic.svg` (ICON_FAN, app.rs:25)
-  - `pump-symbolic.svg` (ICON_PUMP, app.rs:26)
-  - `snowflake-symbolic.svg` (ICON_SNOWFLAKE, app.rs:24)
-  - `temperature-symbolic.svg` (ICON_TEMP, app.rs:23)
+- `resources/icons/` — four symbolic SVGs actually used in the panel UI, embedded via `include_bytes!` and now declared as `pub(crate)` consts in `src/view.rs` (moved from `app.rs` during the view-layer extraction):
+  - `fan-symbolic.svg` (`view::ICON_FAN`, view.rs:24)
+  - `pump-symbolic.svg` (`view::ICON_PUMP`, view.rs:25)
+  - `snowflake-symbolic.svg` (`view::ICON_SNOWFLAKE`, view.rs:22-23)
+  - `temperature-symbolic.svg` (`view::ICON_TEMP`, view.rs:21)
 
-These symbolic icons are themed/recoloured by the COSMIC compositor (via `symbolic = true` flag in `symbolic_icon()`), while the stub app icon means the applet has no distinct launcher icon in software centers.
+These symbolic icons are themed/recoloured by the COSMIC compositor (via `symbolic = true` flag in `view::symbolic_icon()`), while the stub app icon means the applet has no distinct launcher icon in software centers.
 
-## CI/CD Architecture (git history: commit 6f9b43b)
+## CI/CD Architecture (git history: commit 6f9b43b) — SUPERSEDED 2026-06-12
 
-The `.github/workflows/` directory exists in git history but is NOT present in the working tree. The workflows are:
-
-### ci.yml
-
-- Trigger: push to `main`, PRs (with concurrency cancel-in-progress)
-- Runner: `ubuntu-24.04`
-- Toolchain: `dtolnay/rust-toolchain@stable` (floating, not pinned to a version)
-- Cache: `Swatinem/rust-cache@v2`
-- Steps in order: `cargo fmt --check` → `cargo clippy` (with `RUSTFLAGS=-D warnings`) → `cargo test` → `cargo build --release`
-
-### release.yml
-
-- Trigger: tags matching `v*`
-- Steps: install `cargo-deb` → `cargo build --release` → strip binary → `cargo deb --no-build` → smoke-test install/uninstall → create `liquidmon-<version>-x86_64-linux.tar.gz` + `SHA256SUMS` → upload all artifacts via `softprops/action-gh-release@v2`
+The `.github/workflows/` directory EXISTS ON DISK and is up-to-date. The earlier claim that "workflows exist only in git history / NOT present in the working tree" was stale. See "CI/CD Pipeline — UPDATED 2026-06-12" and "Release Workflow — UPDATED 2026-06-12" above for current detail.
 
 ## Release Artifact Set
 
@@ -422,11 +452,11 @@ A tagged release produces three artifacts uploaded to GitHub Releases:
 2. `liquidmon-<version>-x86_64-linux.tar.gz` — raw tarball (binary + desktop + icon + metainfo)
 3. `SHA256SUMS` — checksums for both archives
 
-## Popup Visualization Widgets and Spinner Animation (src/equalizer.rs, src/spinner.rs)
+## Popup Visualization Widgets and Spinner Animation — UPDATED 2026-06-12
 
-The popup metric history is rendered as an 80s graphic-equalizer / VU-meter instead of a smooth sparkline. The panel button still uses `sparkline.rs` (small 36×16 trend glyph); the **popup** uses these two new canvas widgets:
+The popup metric history is rendered as an 80s graphic-equalizer / VU-meter instead of a smooth sparkline. The panel button still uses `sparkline.rs` (small 36×16 trend glyph); the **popup** uses these two canvas widgets:
 
-- **`equalizer.rs` — `Equalizer { samples, lo, hi }`**: a `canvas::Program` that bins the sample window into a **fixed** number of columns (`(bounds.width / COL_PITCH=7px).max(1)` — count is anchored to width, NOT sample count, so the bar count stays constant as history accumulates; an earlier `clamp(1, samples.len())` made the column count grow over time, which read as a bug). Each column is a stack of `SEGMENTS=10` LED cells lit bottom-up. **Normalisation is against the caller-supplied absolute range `lo..=hi`, clamped — NOT auto-scaled.** This is load-bearing: an auto-scaled window stretches a 0.2 °C wiggle across the whole meter and paints the tallest bar red, making the VU colour ramp meaningless. Colour follows the classic ramp by absolute height (green < `GREEN_MAX=0.6` of stack, amber < `AMBER_MAX=0.85`, red above); topmost lit cell is a full-intensity "peak cap", lower lit cells alpha 0.82, unlit cells theme `background.on` at alpha 0.10. Ranges are defined in `app.rs`: `TEMP_RANGE=(20.0,55.0)` °C for coolant, `DUTY_RANGE=(0.0,100.0)` % for pump/fan duty (the pump/fan meters plot **duty %**, not rpm — rpm is in the header readout only). Sized `Length::Fill`.
+- **`equalizer.rs` — `Equalizer { samples, lo, hi }`**: a `canvas::Program` that bins the sample window into a **fixed** number of columns (`(bounds.width / COL_PITCH=7px).max(1)` — count is anchored to width, NOT sample count, so the bar count stays constant as history accumulates). Each column is a stack of `SEGMENTS=10` LED cells lit bottom-up. **Normalisation is against the caller-supplied absolute range `lo..=hi`, clamped — NOT auto-scaled.** This is load-bearing: an auto-scaled window stretches a 0.2 °C wiggle across the whole meter and paints the tallest bar red, making the VU colour ramp meaningless. Colour follows the classic ramp by absolute height (green < `GREEN_MAX=0.6` of stack, amber < `AMBER_MAX=0.85`, red above); topmost lit cell is a full-intensity "peak cap", lower lit cells alpha 0.82, unlit cells theme `background.on` at alpha 0.10. Ranges are defined in **`src/view.rs`** (not `app.rs`): `TEMP_RANGE=(20.0,55.0)` °C for coolant, `DUTY_RANGE=(0.0,100.0)` % for pump/fan duty (the pump/fan meters plot **duty %**, not rpm — rpm is in the header readout only). Sized `Length::Fill`.
 - **`spinner.rs` — `Spinner` { kind: `Kind::{Fan,Pump}`, rpm, clock }**: a `canvas::Program` that redraws the same blade/impeller geometry as `fan-symbolic.svg` / `pump-symbolic.svg` (paths transcribed into `Path::bezier_curve_to` calls, scaled by `size/16.0`), rotated by `clock * rpm * RPM_TO_RAD_PER_S` (tuned so ~2000 rpm ≈ one screen turn/sec, not the true ~33/sec). Drawn monochrome in theme `background.on`. Used only in popup metric headers (22×22 px), NOT the panel button.
 
 **Animation loop.** `AppModel` gained `anim_t: f32` (seconds) and `Message::AnimationTick`. `subscription()` appends `cosmic::iced::time::every(33ms).map(|_| AnimationTick)` **only when `self.popup.is_some()`**, so the applet does zero continuous redraw when collapsed. `update` advances `anim_t = (anim_t + 0.033) % 3600.0` (wrap before f32 precision degrades; spinners read it modulo a full turn). Each `Spinner` receives `self.anim_t` and computes its own angle from its rpm — one shared clock drives differently-paced fan and pump glyphs.

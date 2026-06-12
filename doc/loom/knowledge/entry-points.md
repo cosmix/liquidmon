@@ -3,48 +3,54 @@
 > Key files agents should read first to understand the codebase.
 > This file is append-only - agents add discoveries, never delete.
 
-## Reading Order for New Contributors
+## Reading Order for New Contributors — UPDATED 2026-06-12
 
 Read files in this order to understand the codebase end-to-end:
 
-1. `src/main.rs` (11 lines) — Entry point. Calls `cosmic::applet::run::<AppModel>(())`. Tiny file; establishes the five module names (`app`, `config`, `devices`, `liquidctl`, `sparkline`).
-2. `src/app.rs` (~1148 lines) — Core application logic. Defines `AppModel`, the `Message` enum, and all `cosmic::Application` trait implementations. The most important file in the codebase.
-3. `src/liquidctl.rs` (~629 lines) — All communication with the `liquidctl` process. Defines the public `AioStatus`, `Pump`, `Fan`, `DetectedDevice`, and `Error` types; implements `fetch_status()` and `list_devices()` async functions and the JSON parsers. All subprocess calls serialize behind a module-private `LIQUIDCTL_LOCK` mutex.
-4. `src/devices.rs` (~100 lines) — AIO classification helpers. Contains the `AIO_PATTERNS` substring catalog (lowercase, narrow to families verified against the parser schema), plus pure helpers `is_aio`, `filter_aios`, and `auto_select`.
-5. `src/sparkline.rs` (240 lines) — Iced `Canvas` widget that renders a gradient-filled sparkline from a slice of f64 samples. Used in `view()` (panel) and multiple sites in `popup_metrics_view`.
-6. `src/config.rs` (~21 lines) — COSMIC config struct, `#[version = 3]`. Contains `sample_interval_ms: u64` (default 1500) and `device_match: Option<String>` (default `None` = auto-detect).
+1. `src/main.rs` (14 lines) — Entry point. Calls `cosmic::applet::run::<AppModel>(())`. Tiny file; declares the eight module names (`app`, `config`, `devices`, `equalizer`, `liquidctl`, `sparkline`, `spinner`, `view`).
+2. `src/app.rs` (~1225 lines) — Core application logic. Defines `AppModel`, the `Message` enum, and all `cosmic::Application` trait implementations including the `popup_metrics_view` orchestrator. The most important file in the codebase.
+3. `src/view.rs` (~411 lines) — Stateless popup widget builders extracted from `app.rs`. Holds `ICON_*` consts, `TEMP_RANGE`/`DUTY_RANGE`, `symbolic_icon`/`symbolic_icon_sized`, `eq_canvas`, `metric_block`, `metric_value`, `fan_rows`, `spinner_glyph`, `interval_control`, `dropdown_entries`, `device_dropdown_section`, `device_dropdown_selected`, and the dropdown tests. All items are `pub(crate)`.
+4. `src/liquidctl.rs` — All communication with the `liquidctl` process. Defines the public `AioStatus`, `Pump`, `Fan`, `DetectedDevice`, and `Error` types; implements `fetch_status()` and `list_devices()` async functions and the JSON parsers. All subprocess calls serialize behind a module-private `LIQUIDCTL_LOCK` mutex.
+5. `src/devices.rs` (~100 lines) — AIO classification helpers. Contains the `AIO_PATTERNS` substring catalog (lowercase, narrow to families verified against the parser schema), plus pure helpers `is_aio`, `filter_aios`, and `auto_select`.
+6. `src/sparkline.rs` — Iced `Canvas` widget that renders a gradient-filled sparkline from a slice of f64 samples. Used in `view()` (panel button only).
+7. `src/config.rs` (~21 lines) — COSMIC config struct, `#[version = 3]`. Contains `sample_interval_ms: u64` (default 1500) and `device_match: Option<String>` (default `None` = auto-detect).
 
-## Key Types and Their Locations
+## Key Types and Their Locations — UPDATED 2026-06-12
 
 | Type              | File               | Purpose                                                                                  |
 | ----------------- | ------------------ | ---------------------------------------------------------------------------------------- |
-| `AppModel`        | `src/app.rs`       | Top-level application state (12 fields incl. `detected_devices`, `device_scan_in_flight`) |
-| `Message`         | `src/app.rs`       | All UI/async events (8 variants incl. `DevicesEnumerated`, `DeviceSelected`)              |
+| `AppModel`        | `src/app.rs`       | Top-level application state (14 fields incl. `anim_t`, `enumeration_retried`)            |
+| `Message`         | `src/app.rs`       | All UI/async events (9 variants incl. `StatusTick{match_str,result}`, `AnimationTick`)   |
 | `AioStatus`       | `src/liquidctl.rs` | Parsed snapshot from `liquidctl --json status`                                            |
 | `Pump`            | `src/liquidctl.rs` | Pump speed + duty                                                                         |
-| `Fan`             | `src/liquidctl.rs` | Per-fan speed + duty                                                                      |
+| `Fan`             | `src/liquidctl.rs` | Per-fan index + speed + duty                                                              |
 | `DetectedDevice`  | `src/liquidctl.rs` | Public type emitted by `list_devices` — `description`, `bus`, `address`                    |
-| `Error`           | `src/liquidctl.rs` | liquidctl integration errors (six variants — shared by `fetch_status` and `list_devices`) |
+| `Error`           | `src/liquidctl.rs` | liquidctl integration errors (six variants; `MissingField` is now a struct variant)      |
 | `Config`          | `src/config.rs`    | Persisted user settings (`sample_interval_ms: u64`, `device_match: Option<String>`) — v3   |
-| `Sparkline`       | `src/sparkline.rs` | Canvas widget for gradient-filled sparkline                                              |
+| `Sparkline`       | `src/sparkline.rs` | Canvas widget for gradient-filled sparkline (panel button only)                          |
+| `Equalizer`       | `src/equalizer.rs` | Canvas VU-meter widget for popup metric histories                                        |
+| `Spinner`         | `src/spinner.rs`   | Canvas animated fan/pump glyph widget                                                    |
 | `DeviceEntry`     | `src/liquidctl.rs` | Private — raw `--json status` device                                                     |
-| `StatusEntry`     | `src/liquidctl.rs` | Private — raw status key/value/unit                                                       |
+| `StatusEntry`     | `src/liquidctl.rs` | Private — raw status key/value(`serde_json::Value`)/unit                                  |
 | `ListDeviceEntry` | `src/liquidctl.rs` | Private — raw `list --json` entry; tolerant string deserialization for `bus`/`address`     |
 
-## Notable Constants and Statics
+## Notable Constants and Statics — UPDATED 2026-06-12
 
-| Identifier            | Location         | Value / Purpose                                                                  |
-| --------------------- | ---------------- | -------------------------------------------------------------------------------- |
-| `APP_ID`              | `src/app.rs:144` | `"com.github.cosmix.LiquidMon"` — RDNN for config and desktop                   |
-| `AUTOSIZE_ID`         | `src/app.rs:19`  | `LazyLock<widget::Id>` — stable ID for the autosize wrapper                     |
-| `PANEL_SPARK_SAMPLES` | `src/app.rs:21`  | `60` — trailing-N window of `temp_history` fed to the panel button sparkline     |
-| `HISTORY_CAP`         | `src/app.rs:22`  | `900` — maximum entries in each per-metric `VecDeque` (~15 min at 1 s polling)   |
-| `MIN_INTERVAL_MS`     | `src/app.rs:23`  | `1000` — lower bound (ms) for the user-configurable sample interval              |
-| `MAX_INTERVAL_MS`     | `src/app.rs:24`  | `10000` — upper bound (ms) for the user-configurable sample interval             |
-| `ICON_TEMP`           | `src/app.rs:26`  | Embedded SVG bytes for temperature icon                                          |
-| `ICON_SNOWFLAKE`      | `src/app.rs:27`  | Embedded SVG bytes for snowflake/coolant icon                                    |
-| `ICON_FAN`            | `src/app.rs:28`  | Embedded SVG bytes for fan icon                                                  |
-| `ICON_PUMP`           | `src/app.rs:29`  | Embedded SVG bytes for pump icon                                                 |
+| Identifier            | Location          | Value / Purpose                                                                  |
+| --------------------- | ----------------- | -------------------------------------------------------------------------------- |
+| `APP_ID`              | `src/app.rs`      | `"com.github.cosmix.LiquidMon"` — RDNN for config and desktop                   |
+| `AUTOSIZE_ID`         | `src/app.rs:23`   | `LazyLock<widget::Id>` — stable ID for the autosize wrapper                     |
+| `PANEL_SPARK_SAMPLES` | `src/app.rs:25`   | `60` — trailing-N window of `temp_history` fed to the panel button sparkline     |
+| `HISTORY_CAP`         | `src/app.rs:26`   | `900` — maximum entries in each per-metric `VecDeque` (~15 min at 1 s polling)   |
+| `MIN_INTERVAL_MS`     | `src/app.rs:27`   | `1000` — lower bound (ms) for the user-configurable sample interval              |
+| `MAX_INTERVAL_MS`     | `src/app.rs:28`   | `10000` — upper bound (ms) for the user-configurable sample interval             |
+| `ANIM_INTERVAL`       | `src/app.rs:33`   | `Duration::from_millis(33)` — animation tick rate and per-tick `anim_t` advance  |
+| `ICON_TEMP`           | `src/view.rs:21`  | `pub(crate)` — embedded SVG bytes for temperature icon (moved from app.rs)       |
+| `ICON_SNOWFLAKE`      | `src/view.rs:22`  | `pub(crate)` — embedded SVG bytes for snowflake/coolant icon                     |
+| `ICON_FAN`            | `src/view.rs:24`  | `pub(crate)` — embedded SVG bytes for fan icon                                   |
+| `ICON_PUMP`           | `src/view.rs:25`  | `pub(crate)` — embedded SVG bytes for pump icon                                  |
+| `TEMP_RANGE`          | `src/view.rs:30`  | `pub(crate)` — `(20.0, 55.0)` °C — absolute range for coolant equalizer          |
+| `DUTY_RANGE`          | `src/view.rs:31`  | `pub(crate)` — `(0.0, 100.0)` % — absolute range for pump/fan duty equalizers    |
 
 ## Critical Code Paths
 
@@ -95,48 +101,47 @@ The `TogglePopup` open branch now batches `get_popup` with a fresh `list_devices
 | New async background task | `src/app.rs:subscription`     | Append to the `subs` Vec; key on whatever data should restart the stream            |
 | New AIO family pattern    | `src/devices.rs:AIO_PATTERNS` | Add a lowercase substring; pair with parser-schema verification                    |
 
-## Test Coverage
+## Test Coverage — UPDATED 2026-06-12
 
-Tests live in two `#[cfg(test)] mod tests` blocks: one at the bottom of `src/liquidctl.rs` and one at the bottom of `src/app.rs`. 45 unit tests total. Run with `cargo test`.
+Tests live in `#[cfg(test)] mod tests` blocks at the bottom of each relevant file. **109 unit tests total.** Run with `cargo test`.
 
-### `src/liquidctl.rs` — parser tests (20)
+Per-module counts (verified): `app`=40, `liquidctl`=30, `view`=11, `equalizer`=10, `sparkline`=9, `devices`=6, `spinner`=3.
 
-Fixture and error-path coverage:
+### `src/liquidctl.rs` — parser tests (30)
 
-- `parses_h150i_pro_xt_fixture` — full parse of a real H150i Pro XT JSON snapshot; verifies temperature, pump, and all three fans
+Fixture and error-path coverage including:
+
+- `parses_h150i_pro_xt_fixture` — full parse of a real H150i Pro XT JSON snapshot
 - `empty_array_yields_no_device`, `all_devices_empty_status_yields_no_device` — `Error::NoDevice` paths
-- `device_missing_liquid_temp_yields_missing_field`, `device_missing_pump_speed_yields_missing_field`, `device_missing_pump_duty_yields_missing_field` — required-field absence yields `Error::MissingField(<name>)`
-- `fan_with_only_speed_is_dropped`, `fan_with_only_duty_is_dropped` — fans missing one of speed/duty are filtered out (filter at `liquidctl.rs:190-200`)
-- `fan_index_zero_is_ignored` — `Fan 0` keys silently dropped per `split_fan_key`
-- `fans_emerge_sorted_by_index` — shuffled-input fans come out ordered (BTreeMap + explicit sort)
-- `out_of_range_pump_duty_is_clamped`, `negative_values_clamp_to_zero` — `to_u8_pct`/`to_u32` bounds
-- `first_device_with_status_is_selected` — multi-device selection picks first non-empty `status`
-- `unknown_keys_are_silently_ignored` — extraneous keys (e.g. `Firmware version`) don't break parsing
-- `malformed_json_yields_parse_error` — invalid JSON → `Error::Parse`
-- `split_fan_key_extracts_index_and_suffix`, `split_fan_key_rejects_zero_and_malformed` — direct unit tests of the private helper
-- `display_includes_field_name_for_missing_field`, `display_for_no_device_and_timeout` — `Display` impl smoke tests
-- `error_source_chains_for_inner_io_and_parse` — `std::error::Error::source()` chains for `Spawn`/`Parse`, returns `None` for `NoDevice`/`MissingField`/`Timeout`
+- `device_missing_liquid_temp_yields_missing_field` etc. — required-field absence yields `Error::MissingField{field,device}`
+- `fan_with_only_speed_is_dropped`, `fan_with_only_duty_is_dropped` — fans missing one of speed/duty are filtered
+- `fan_index_zero_is_ignored`, `fans_emerge_sorted_by_index` — index policy
+- `out_of_range_pump_duty_is_clamped`, `negative_values_clamp_to_zero` — cast-helper bounds
+- `first_device_with_status_is_selected`, `unknown_keys_are_silently_ignored`, `malformed_json_yields_parse_error`
+- `split_fan_key_*`, `display_*`, `error_source_chains_*` — helper and Display tests
 
-### `src/app.rs` — model tests (25)
+### `src/app.rs` — model tests (40)
 
-Helper and `update()` state-transition tests. The test module imports `cosmic::Application as _` to bring the trait method `update` into scope, and constructs `AppModel` via `AppModel::default()`:
+Helper and `update()` state-transition tests. Constructs model via `AppModel::default()`:
 
-- `fan_duty_avg_is_none_for_empty`, `fan_duty_avg_computes_integer_mean`, `fan_duty_avg_truncates_toward_zero`, `fan_duty_avg_at_max` — `fan_duty_avg` helper
-- `fan_speed_avg_computes_integer_mean` — `fan_speed_avg` helper (new); also tests the `None` case for empty fans
-- `status_tick_ok_appends_temp_and_clears_error` — `StatusTick(Ok)` pushes to `temp_history`, sets `last_status`, clears `last_error`
-- `status_tick_err_preserves_stale_status` — `StatusTick(Err)` sets `last_error` but does NOT clear `last_status`
-- `temp_history_caps_at_history_cap` — pushing `HISTORY_CAP + 10` samples leaves exactly `HISTORY_CAP = 900`, oldest entries dropped
-- `status_tick_ok_appends_to_all_metric_histories` — temp / pump-duty / fan-avg-duty histories all grow on a tick with fans; fan-average duty is computed correctly
-- `status_tick_with_no_fans_skips_fan_history_push` — fan histories remain empty when `status.fans` is empty
-- `sample_interval_dragged_stages_pending_value` — `SampleIntervalDragged` stores transient value without changing `config.sample_interval_ms`
-- `sample_interval_released_commits_clamped_value` — `SampleIntervalReleased` commits and clears pending value
-- `sample_interval_released_clamps_above_max` — values above `MAX_INTERVAL_MS` are clamped
-- `sample_interval_released_clamps_below_min` — values below `MIN_INTERVAL_MS` are clamped
-- `sample_interval_released_without_drag_is_noop` — no-op when `pending_interval_secs` is `None`
-- `popup_closed_with_matching_id_clears_popup`, `popup_closed_with_non_matching_id_is_noop` — `PopupClosed(Id)` only clears when the id matches
-- `update_config_replaces_config` — `UpdateConfig(Config)` arm runs without disturbing other state
+- `fan_duty_avg_*` — `fan_duty_avg` rounds to nearest (not truncating)
+- `fan_speed_avg_*` — `fan_speed_avg` helper
+- `status_tick_ok_*`, `status_tick_err_*`, `temp_history_caps_*`, `status_tick_with_no_fans_*`
+- `sample_interval_*` — drag/release/clamp/noop cases
+- `popup_closed_*`, `update_config_*`
 
-Not covered: `view`/`view_window` rendering, `subscription`, the `TogglePopup` arm (touches `core.main_window_id()`), and `fetch_status`'s subprocess invocation (only the pure `parse_status_response` is exercised).
+### `src/view.rs` — dropdown tests (11)
+
+Tests for `dropdown_entries`, `device_dropdown_items`, `device_dropdown_selected`:
+
+- `dropdown_items_includes_auto_first`, `dropdown_items_appends_disconnected_synthetic_when_saved_missing`, `dropdown_items_omits_synthetic_when_saved_is_connected`, `dropdown_items_omits_auto_picked_device_from_explicit_list`, `dropdown_items_lists_non_auto_aios_explicitly`
+- `dropdown_omits_disconnected_for_connected_non_aio_saved` — gated on full device list
+- `dropdown_commits_real_value_not_display_label`
+- `dropdown_selected_*` — selected-index resolution cases
+
+### `src/equalizer.rs` — canvas tests (10), `src/sparkline.rs` — canvas tests (9), `src/devices.rs` — classification tests (6), `src/spinner.rs` — animation tests (3)
+
+Not covered: `view`/`view_window` rendering, `subscription`, the `TogglePopup` arm (touches `core.main_window_id()`), and `fetch_status`'s subprocess invocation.
 
 ## Build and Development Workflow
 
@@ -170,20 +175,17 @@ just install rootdir=$HOME/.local
 
 Changing the app ID requires updating all four locations plus reinstalling.
 
-## CI/CD Entry Points
+## CI/CD Entry Points — UPDATED 2026-06-12
 
-The workflow files exist only in git history (committed in `6f9b43b`, not currently on-disk). To review them:
-
-```text
-git show 6f9b43b:.github/workflows/ci.yml
-git show 6f9b43b:.github/workflows/release.yml
-```
+The workflow files are present on disk at `.github/workflows/ci.yml` and `.github/workflows/release.yml`. The earlier entry claiming they were "only in git history" was stale.
 
 New contributors should understand:
 
-- CI runs on push to `main` and all PRs — fmt, clippy (pedantic, warnings-as-errors), test, release build
-- Releases are tag-driven: push `v*` tag → `.deb` + tarball + SHA256SUMS → GitHub release
-- Use `just tag <version>` to bump version, commit, and tag in one step
+- `just ci-local` mirrors the CI `check` job exactly (fmt + clippy `-D warnings` + test + release build)
+- `just check` is the PEDANTIC local lint (adds `-W clippy::pedantic`); it is advisory only — NOT the CI gate
+- CI runs on push to `main` and all PRs — has a separate `audit` job for `cargo audit`
+- Releases are tag-driven: push `v*` tag → `.deb` + tarball + SHA256SUMS → GitHub release; release.yml verifies Cargo.toml version matches tag
+- Use `just tag <version>` to bump version (semver guard), commit, and tag in one step
 
 ## Resources Directory — Complete File List
 

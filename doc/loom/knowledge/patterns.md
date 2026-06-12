@@ -20,9 +20,9 @@ Error::Timeout                        — subprocess did not complete within the
 
 `Display` is hand-implemented with match arms that produce human-readable messages (liquidctl.rs:46-70). `std::error::Error::source()` is implemented to chain underlying `io::Error` or `serde_json::Error` causes (liquidctl.rs:72-80); the `_ => None` arm covers `NoDevice`, `MissingField`, and `Timeout` since none carry an inner source. `From<io::Error>` and `From<serde_json::Error>` allow `?` propagation inside `fetch_status` (liquidctl.rs:82-92).
 
-### MissingField carries a &'static str field name (liquidctl.rs:42)
+### MissingField is a struct variant — UPDATED 2026-06-12
 
-`Error::MissingField(&'static str)` carries the name of the missing field as a string literal (e.g. `"liquid temperature"`, `"pump speed"`, `"pump duty"`). This distinguishes a device that was found but had incomplete data from one that was never found (`Error::NoDevice`). The static string allows the variant to be `Debug`-printed and matched in tests without allocation.
+`Error::MissingField { field: &'static str, device: String }` carries both the field name and the device description. The `field` name (e.g. `"liquid temperature"`, `"pump speed"`, `"pump duty"`) stays `&'static str` for allocation-free matching in tests. The `device: String` carries the device description and is built only on the cold error path, making the error self-diagnosing (e.g. `device "Corsair Hydro 360i Elite" found but missing required status field: liquid temperature`). This distinguishes a device that was found but had incomplete data from one that was never found (`Error::NoDevice`).
 
 ### Bounded cast helpers for f64 → integer conversion (liquidctl.rs:150-152)
 
@@ -103,13 +103,15 @@ This pattern encodes "stale + error" distinctly from "no data + error".
 
 ## Async Patterns
 
-### Subscription-based background polling (app.rs:221-246)
+### Subscription-based background polling — UPDATED 2026-06-12
 
-The subscription uses `Subscription::batch` containing two subscriptions:
+The subscription uses `Subscription::batch` containing up to three subscriptions:
 
-1. **liquidctl poll** (`app.rs:276-290`): `Subscription::run_with(interval_ms, fn_ptr)` wraps `cosmic::iced::stream::channel(4, ...)` — a channel with buffer size 4. The async closure runs an infinite loop: call `fetch_status`, send result, sleep `config.sample_interval_ms` (default 1500, user-configurable). If the send fails (channel closed), it breaks and then awaits `futures_util::future::pending()` to keep the future alive. The subscription identity includes `interval_ms`, so changing the configured interval tears down and restarts the poll loop.
+1. **liquidctl poll** (`app.rs`): `Subscription::run_with((interval_ms, match_str), fn_ptr)` wraps `cosmic::iced::stream::channel(4, ...)`. The async closure runs an infinite loop using `tokio::time::interval` + `MissedTickBehavior::Delay` — tick fires at the TOP of the loop so the effective sample period equals the configured interval regardless of fetch duration; the first tick resolves immediately (no initial delay). If the send fails (channel closed), the stream function returns — no need to park on `futures_util::future::pending()`. The subscription identity is `(interval_ms, match_str)`, so changing either tears down and restarts the loop.
 
-2. **Config watch** (`app.rs:241-244`): `self.core().watch_config::<Config>(APP_ID).map(...)` maps config update events to `Message::UpdateConfig`.
+2. **Config watch** (`app.rs`): `self.core().watch_config::<Config>(APP_ID).map(...)` maps config update events to `Message::UpdateConfig`.
+
+3. **Animation tick** (`app.rs`) — appended ONLY when `self.popup.is_some()`: `cosmic::iced::time::every(ANIM_INTERVAL).map(|_| Message::AnimationTick)`. Drives spinner glyph rotation while the popup is open; zero redraw overhead when the applet is collapsed.
 
 ### tokio::process::Command for subprocess (liquidctl.rs:116-122)
 
@@ -234,42 +236,48 @@ static AUTOSIZE_ID: LazyLock<widget::Id> =
 
 `widget::Id` is not `const`-constructible; a `static LazyLock` initialises it once on first access. The same `AUTOSIZE_ID.clone()` is passed to `autosize::autosize(button, AUTOSIZE_ID.clone())` (app.rs:164) every render cycle, giving the autosize wrapper a stable identity across redraws. Using `LazyLock` (from `std::sync`) is preferred over `once_cell::sync::Lazy` — no third-party dependency needed.
 
-## include_bytes\! for Embedded SVG Icons (src/app.rs:23-26)
+## include_bytes! for Embedded SVG Icons — UPDATED 2026-06-12 (src/view.rs:21-25)
 
 ```rust
-const ICON_TEMP: &[u8]      = include_bytes\!("../resources/icons/temperature-symbolic.svg");
-const ICON_SNOWFLAKE: &[u8] = include_bytes\!("../resources/icons/snowflake-symbolic.svg");
-const ICON_FAN: &[u8]       = include_bytes\!("../resources/icons/fan-symbolic.svg");
-const ICON_PUMP: &[u8]      = include_bytes\!("../resources/icons/pump-symbolic.svg");
+pub(crate) const ICON_TEMP: &[u8]      = include_bytes!("../resources/icons/temperature-symbolic.svg");
+pub(crate) const ICON_SNOWFLAKE: &[u8] = include_bytes!("../resources/icons/snowflake-symbolic.svg");
+pub(crate) const ICON_FAN: &[u8]       = include_bytes!("../resources/icons/fan-symbolic.svg");
+pub(crate) const ICON_PUMP: &[u8]      = include_bytes!("../resources/icons/pump-symbolic.svg");
 ```
 
-SVG icon files are embedded at compile time as `&'static [u8]` constants via `include_bytes\!`. This avoids runtime filesystem access and ensures icons are always available. The path is relative to `src/app.rs`, so the macro resolves to `resources/icons/` at the crate root.
+SVG icon files are embedded at compile time as `pub(crate) &'static [u8]` constants via `include_bytes!`. Now declared in `src/view.rs` (moved from `src/app.rs` during the view-layer extraction). The path is relative to `src/view.rs`, so the macro still resolves to `resources/icons/` at the crate root.
 
-## symbolic_icon() Helper (src/app.rs:28-32)
+## symbolic_icon() and symbolic_icon_sized() Helpers — UPDATED 2026-06-12 (src/view.rs:33-41)
 
 ```rust
-fn symbolic_icon(bytes: &'static [u8]) -> widget::icon::Icon {
+pub(crate) fn symbolic_icon_sized(bytes: &'static [u8], size: u16) -> widget::icon::Icon {
     let mut handle = widget::icon::from_svg_bytes(bytes);
     handle.symbolic = true;
-    widget::icon::icon(handle).size(14)
+    widget::icon::icon(handle).size(size)
+}
+
+pub(crate) fn symbolic_icon(bytes: &'static [u8]) -> widget::icon::Icon {
+    symbolic_icon_sized(bytes, 14)
 }
 ```
 
-Takes a `&'static [u8]` (an embedded SVG), creates a mutable icon handle via `widget::icon::from_svg_bytes`, sets `handle.symbolic = true` so the icon is recoloured to match the panel text colour (COSMIC symbolic icon convention), then wraps it in a `widget::icon::icon(handle).size(14)` widget. All four icons (temperature, snowflake, fan, pump) are rendered this way.
+Now in `src/view.rs` with `pub(crate)` visibility. `symbolic_icon_sized` is the base (takes an explicit pixel size); `symbolic_icon` is a thin wrapper at the default 14 px. All four icons are rendered this way. Setting `handle.symbolic = true` causes the COSMIC compositor to recolour the icon to match the panel text colour.
 
-## fan_duty_avg() Computation (src/app.rs:34-40)
+## fan_duty_avg() Computation — UPDATED 2026-06-12
 
 ```rust
 fn fan_duty_avg(fans: &[crate::liquidctl::Fan]) -> Option<u8> {
     if fans.is_empty() {
         return None;
     }
+    let len = fans.len() as u32;
     let sum: u32 = fans.iter().map(|f| u32::from(f.duty_pct)).sum();
-    Some((sum / fans.len() as u32) as u8)
+    // Round to nearest rather than truncating toward zero.
+    Some(((sum + len / 2) / len) as u8)
 }
 ```
 
-Returns `None` if the fan slice is empty (no fans reported). Otherwise widens `duty_pct: u8` to `u32` before summing to avoid overflow on realistic fan counts, then performs integer division by `fans.len() as u32` and casts back to `u8`. No rounding — truncating integer division. Called in `view()` to produce the panel fan% label; a `None` result renders as `"—"` (app.rs:124-127).
+Returns `None` if the fan slice is empty (no fans reported). Otherwise widens `duty_pct: u8` to `u32` before summing to avoid overflow, then **rounds to nearest** via `(sum + len/2) / len` and casts back to `u8`. The same rounding idiom is applied in `fan_speed_avg` (`fans.len() as u64` to prevent overflow on rpm values). Called in `view()` to produce the panel fan% label; a `None` result renders as `"—"`. The former truncating behavior ("No rounding — truncating integer division") was a resolved concern (m5).
 
 ## get_popup SctkPopupSettings (src/app.rs:276-298)
 
@@ -379,14 +387,17 @@ let interval_ms = self.config.sample_interval_ms.clamp(MIN_INTERVAL_MS, MAX_INTE
 let liquidctl_sub = Subscription::run_with(interval_ms, |interval_ms: &u64| {
     let interval_ms = *interval_ms;  // copy out of the reference — fn can't capture
     cosmic::iced::stream::channel(4, move |mut channel: mpsc::Sender<Message>| async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            // … fetch, send, sleep interval_ms …
+            ticker.tick().await;  // tick at TOP — period is tick-to-tick, not fetch-to-fetch
+            // … fetch, send …
         }
     })
 });
 ```
 
-Because only `SampleIntervalReleased` mutates `self.config.sample_interval_ms`, the subscription identity — and therefore the running poll loop — is stable during a drag. The loop only tears down and restarts after the user releases the slider and commits a new value (`src/app.rs:269-302`).
+Because only `SampleIntervalReleased` mutates `self.config.sample_interval_ms`, the subscription identity — and therefore the running poll loop — is stable during a drag. The loop only tears down and restarts after the user releases the slider and commits a new value. The `MissedTickBehavior::Delay` policy means a slow fetch skips no ticks — it just delays the next one — rather than bursting to catch up.
 
 ## Subscription Composite Key (`(interval_ms, match_str)`) and Optional Poll (src/app.rs)
 
@@ -398,12 +409,20 @@ Subscription::run_with(key, |key: &(u64, String)| {
     let interval_ms = key.0;
     let match_str = key.1.clone();
     cosmic::iced::stream::channel(4, move |mut channel| async move {
-        loop { /* fetch_status(&match_str) … sleep interval_ms */ }
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let result = fetch_status(&match_str).await.map_err(|e| format!("{e}"));
+            if channel.send(Message::StatusTick { match_str: match_str.clone(), result }).await.is_err() {
+                return;
+            }
+        }
     })
 })
 ```
 
-The fn pointer is non-capturing (the data tuple rides through), and the inner `async move` clones the string out of the borrow on each subscription start. Either dimension changing — committed interval OR selected device — re-keys the subscription identity and restarts the loop.
+The fn pointer is non-capturing (the data tuple rides through), and the inner `async move` clones the string out of the borrow on each subscription start. Either dimension changing — committed interval OR selected device — re-keys the subscription identity and restarts the loop. `StatusTick` now carries `match_str` so `update` can drop results from superseded subscriptions (stale device).
 
 **Optional poll subscription pattern.** `subscription()` builds a `Vec<Subscription<Message>>` and only appends the poll when `effective_match()` is `Some`. Until the first `DevicesEnumerated` Task lands, no poll runs at all — this prevents the panel from flashing a spurious "no AIO device" error during the brief startup window before enumeration completes. The config-watch sub is always installed and is the only sub before enumeration finishes.
 
