@@ -55,13 +55,16 @@ pub enum Error {
     NonZeroExit { status: Option<i32>, stderr: String },
     Parse(serde_json::Error),
     NoDevice,
-    MissingField(&'static str),
+    MissingField { field: &'static str, device: String },
     Timeout,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::Spawn(e) if e.kind() == io::ErrorKind::NotFound => {
+                write!(f, "liquidctl not found — is it installed and on your PATH?")
+            }
             Error::Spawn(e) => write!(f, "failed to spawn liquidctl: {e}"),
             Error::NonZeroExit { status, stderr } => match status {
                 Some(code) => write!(f, "liquidctl exited with status {code}: {}", stderr.trim()),
@@ -70,8 +73,11 @@ impl fmt::Display for Error {
             Error::Parse(e) => write!(f, "failed to parse liquidctl JSON output: {e}"),
             Error::NoDevice => write!(f, "no matching AIO device with usable status reported"),
             Error::Timeout => write!(f, "liquidctl call timed out"),
-            Error::MissingField(field) => {
-                write!(f, "device found but missing required status field: {field}")
+            Error::MissingField { field, device } => {
+                write!(
+                    f,
+                    "device \"{device}\" found but missing required status field: {field}"
+                )
             }
         }
     }
@@ -113,7 +119,10 @@ struct DeviceEntry {
 #[derive(Debug, Deserialize)]
 struct StatusEntry {
     key: String,
-    value: serde_json::Number,
+    // `serde_json::Value` (not `Number`) so that a string/bool/null status
+    // value deserializes successfully and is silently skipped via the
+    // `as_f64()` guard below, rather than failing the entire device parse.
+    value: serde_json::Value,
     #[allow(dead_code)]
     unit: String,
 }
@@ -121,6 +130,10 @@ struct StatusEntry {
 /// Runs `liquidctl --match <match_filter> --json status`, parses the first
 /// device with a non-empty `status` array, and returns its parsed AioStatus.
 pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
+    // The 3 s timeout below clocks only AFTER this lock is acquired, so the
+    // bound is per-subprocess, not end-to-end: a call queued behind a slow
+    // in-flight call can take lock-wait + timeout total. The two timeouts do
+    // not compose under contention by design (we don't time out lock-wait).
     let _guard = LIQUIDCTL_LOCK.lock().await;
     let mut cmd = Command::new("liquidctl");
     cmd.args(["--match", match_filter, "--json", "status"])
@@ -133,7 +146,7 @@ pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
     if !output.status.success() {
         return Err(Error::NonZeroExit {
             status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr: last_lines(&String::from_utf8_lossy(&output.stderr), 4),
         });
     }
 
@@ -192,9 +205,15 @@ fn parse_status_response(raw: &str) -> Result<AioStatus, Error> {
         }
     }
 
-    let liquid_temp_c = liquid_temp_c.ok_or(Error::MissingField("liquid temperature"))?;
-    let pump_speed_rpm = pump_speed.ok_or(Error::MissingField("pump speed"))?;
-    let pump_duty_pct = pump_duty.ok_or(Error::MissingField("pump duty"))?;
+    // Clone the description for the cold error path so the matched device is
+    // self-diagnosing (e.g. wrong `--match` landing on a non-AIO controller).
+    let missing = |field: &'static str| Error::MissingField {
+        field,
+        device: device.description.clone(),
+    };
+    let liquid_temp_c = liquid_temp_c.ok_or_else(|| missing("liquid temperature"))?;
+    let pump_speed_rpm = pump_speed.ok_or_else(|| missing("pump speed"))?;
+    let pump_duty_pct = pump_duty.ok_or_else(|| missing("pump duty"))?;
 
     let mut fan_list: Vec<Fan> = fans
         .into_iter()
@@ -238,6 +257,10 @@ fn split_fan_key(rest: &str) -> Option<(u8, &str)> {
 /// A 1 s timeout is used — `list` is purely an HID enumeration with no
 /// on-device transaction, so 3 s is unnecessarily generous.
 pub async fn list_devices() -> Result<Vec<DetectedDevice>, Error> {
+    // The 1 s timeout below clocks only AFTER this lock is acquired, so the
+    // bound is per-subprocess, not end-to-end: a call queued behind a slow
+    // in-flight call can take lock-wait + timeout total. The two timeouts do
+    // not compose under contention by design (we don't time out lock-wait).
     let _guard = LIQUIDCTL_LOCK.lock().await;
     let mut cmd = Command::new("liquidctl");
     cmd.args(["list", "--json"]).kill_on_drop(true);
@@ -249,7 +272,7 @@ pub async fn list_devices() -> Result<Vec<DetectedDevice>, Error> {
     if !output.status.success() {
         return Err(Error::NonZeroExit {
             status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr: last_lines(&String::from_utf8_lossy(&output.stderr), 4),
         });
     }
 
@@ -303,6 +326,18 @@ fn deserialize_string_lossy<'de, D: serde::Deserializer<'de>>(d: D) -> Result<St
         serde_json::Value::Number(n) => n.to_string(),
         _ => String::new(),
     })
+}
+
+/// Keeps only the last `n` non-empty lines of `s`, joined with newlines.
+///
+/// liquidctl failures (udev/permission errors) commonly surface as a full
+/// Python traceback; the useful part is the trailing exception line. This
+/// truncation prevents a multi-line traceback from flooding the tiny popup.
+fn last_lines(s: &str, n: usize) -> String {
+    let mut lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines.drain(..start);
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -367,8 +402,13 @@ mod tests {
         // Fixture is the H150i but with the Liquid temperature entry removed.
         let raw = r#"[{"bus": "hid", "address": "/dev/hidraw1", "description": "Corsair Hydro H150i Pro XT", "status": [{"key": "Fan 1 speed", "value": 1000, "unit": "rpm"}, {"key": "Fan 1 duty", "value": 40, "unit": "%"}, {"key": "Pump speed", "value": 2334, "unit": "rpm"}, {"key": "Pump duty", "value": 75, "unit": "%"}]}]"#;
         match parse_status_response(raw) {
-            Err(Error::MissingField("liquid temperature")) => {}
-            other => panic!("expected Error::MissingField(\"liquid temperature\"), got {other:?}"),
+            Err(Error::MissingField {
+                field: "liquid temperature",
+                ..
+            }) => {}
+            other => panic!(
+                "expected Error::MissingField {{ field: \"liquid temperature\", .. }}, got {other:?}"
+            ),
         }
     }
 
@@ -379,8 +419,11 @@ mod tests {
             {"key":"Pump duty","value":75,"unit":"%"}
         ]}]"#;
         match parse_status_response(raw) {
-            Err(Error::MissingField("pump speed")) => {}
-            other => panic!("expected MissingField(\"pump speed\"), got {other:?}"),
+            Err(Error::MissingField {
+                field: "pump speed",
+                ..
+            }) => {}
+            other => panic!("expected MissingField {{ field: \"pump speed\", .. }}, got {other:?}"),
         }
     }
 
@@ -391,8 +434,10 @@ mod tests {
             {"key":"Pump speed","value":2000,"unit":"rpm"}
         ]}]"#;
         match parse_status_response(raw) {
-            Err(Error::MissingField("pump duty")) => {}
-            other => panic!("expected MissingField(\"pump duty\"), got {other:?}"),
+            Err(Error::MissingField {
+                field: "pump duty", ..
+            }) => {}
+            other => panic!("expected MissingField {{ field: \"pump duty\", .. }}, got {other:?}"),
         }
     }
 
@@ -521,6 +566,26 @@ mod tests {
     }
 
     #[test]
+    fn string_valued_status_entry_is_skipped_not_fatal() {
+        // A future firmware-version entry carries a JSON STRING value. With
+        // `StatusEntry.value: serde_json::Value` it deserializes fine and is
+        // skipped by the `as_f64()` guard; the numeric metrics still parse.
+        // (The `unknown_keys_*` test only exercises a numeric unknown key, so
+        // it never covered this string-typed path — see M1.)
+        let raw = r#"[{"bus":"hid","address":"/dev/hidraw1","description":"X","status":[
+            {"key":"Firmware version","value":"1.1.0","unit":""},
+            {"key":"Liquid temperature","value":30.0,"unit":"°C"},
+            {"key":"Pump speed","value":2334,"unit":"rpm"},
+            {"key":"Pump duty","value":75,"unit":"%"}
+        ]}]"#;
+        let status = parse_status_response(raw)
+            .expect("string-valued status entry must not fail the device parse");
+        assert!((status.liquid_temp_c - 30.0).abs() < 1e-9);
+        assert_eq!(status.pump.speed_rpm, 2334);
+        assert_eq!(status.pump.duty_pct, 75);
+    }
+
+    #[test]
     fn malformed_json_yields_parse_error() {
         match parse_status_response("not json at all") {
             Err(Error::Parse(_)) => {}
@@ -544,14 +609,64 @@ mod tests {
 
     #[test]
     fn display_includes_field_name_for_missing_field() {
-        let s = format!("{}", Error::MissingField("liquid temperature"));
+        let s = format!(
+            "{}",
+            Error::MissingField {
+                field: "liquid temperature",
+                device: "Corsair Hydro H150i Pro XT".to_string(),
+            }
+        );
         assert!(s.contains("liquid temperature"), "got: {s}");
+        // m4: the matched device is named so wrong-device targeting is
+        // self-diagnosing rather than reading like a transient glitch.
+        assert!(s.contains("Corsair Hydro H150i Pro XT"), "got: {s}");
     }
 
     #[test]
     fn display_for_no_device_and_timeout() {
         assert!(!format!("{}", Error::NoDevice).is_empty());
         assert!(format!("{}", Error::Timeout).contains("timed out"));
+    }
+
+    #[test]
+    fn display_for_spawn_not_found_mentions_path() {
+        // m3: a missing `liquidctl` binary (common under Wayland panel
+        // sessions / pip installs) should surface actionable guidance.
+        let e = Error::Spawn(io::Error::from(io::ErrorKind::NotFound));
+        let s = format!("{e}");
+        assert!(
+            s.contains("PATH") && s.to_lowercase().contains("installed"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn display_for_spawn_other_kind_keeps_underlying_error() {
+        // Non-NotFound spawn errors retain the underlying message.
+        let e = Error::Spawn(io::Error::other("boom"));
+        let s = format!("{e}");
+        assert!(s.contains("boom"), "got: {s}");
+    }
+
+    #[test]
+    fn last_lines_handles_empty_input() {
+        assert_eq!(last_lines("", 4), "");
+        assert_eq!(last_lines("   \n  \n", 4), "");
+    }
+
+    #[test]
+    fn last_lines_returns_all_when_fewer_than_n() {
+        assert_eq!(last_lines("one\ntwo", 4), "one\ntwo");
+    }
+
+    #[test]
+    fn last_lines_keeps_only_last_n_nonempty_lines() {
+        let input = "Traceback (most recent call last):\n  File a\n  File b\n  File c\n  File d\nOSError: permission denied";
+        // Keep last 3 non-empty lines — the trailing exception line is the
+        // useful part of a Python traceback.
+        let out = last_lines(input, 3);
+        assert_eq!(out, "  File c\n  File d\nOSError: permission denied");
+        assert!(!out.contains("Traceback"), "got: {out}");
     }
 
     #[test]
@@ -569,7 +684,14 @@ mod tests {
 
         // NoDevice / MissingField / Timeout / NonZeroExit have no inner source.
         assert!(Error::NoDevice.source().is_none());
-        assert!(Error::MissingField("x").source().is_none());
+        assert!(
+            Error::MissingField {
+                field: "x",
+                device: String::new(),
+            }
+            .source()
+            .is_none()
+        );
         assert!(Error::Timeout.source().is_none());
     }
 
