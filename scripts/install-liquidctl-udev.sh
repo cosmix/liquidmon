@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Installs liquidctl's udev rules so unprivileged users can access supported
-# devices. Run with sudo. Pulls the canonical rules file from upstream main.
+# devices. Run with sudo. Pulls the canonical rules file from a pinned upstream
+# release tag (update LIQUIDCTL_TAG when upgrading liquidctl).
 #
 # Usage:  sudo ./scripts/install-liquidctl-udev.sh
 
 set -euo pipefail
 
-RULES_URL="https://raw.githubusercontent.com/liquidctl/liquidctl/main/extra/linux/71-liquidctl.rules"
+LIQUIDCTL_TAG="v1.16.0"
+RULES_URL="https://raw.githubusercontent.com/liquidctl/liquidctl/${LIQUIDCTL_TAG}/extra/linux/71-liquidctl.rules"
 DEST="/etc/udev/rules.d/71-liquidctl.rules"
 
 if [[ $EUID -ne 0 ]]; then
