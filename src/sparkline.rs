@@ -61,35 +61,45 @@ impl Sparkline {
 /// `MIN_Y_SPAN` centered on the data midpoint when the natural range is
 /// narrower — this prevents noise from looking like real movement.
 fn y_range(samples: &[f64]) -> (f64, f64) {
+    // Non-finite samples (NaN, ±inf) are silently ignored; if all samples are
+    // non-finite the function falls back to the same default band as the
+    // empty-input case, keeping the caller's coordinate math well-defined.
+    let half = MIN_Y_SPAN * 0.5;
+    let default_band = || (-half, half);
+
     if samples.is_empty() {
-        let half = MIN_Y_SPAN * 0.5;
-        return (-half, half);
+        return default_band();
     }
-    let mut min = samples[0];
-    let mut max = samples[0];
-    for &s in &samples[1..] {
-        if s < min {
-            min = s;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &s in samples {
+        if s.is_finite() {
+            if s < min {
+                min = s;
+            }
+            if s > max {
+                max = s;
+            }
         }
-        if s > max {
-            max = s;
-        }
+    }
+    // All samples were non-finite — treat as empty.
+    if !min.is_finite() {
+        return default_band();
     }
     let span = max - min;
     if span < MIN_Y_SPAN {
         let mid = (min + max) * 0.5;
-        let half = MIN_Y_SPAN * 0.5;
         (mid - half, mid + half)
     } else {
         (min, max)
     }
 }
 
-/// Build a vertical linear gradient (top = tinted at ~half alpha, bottom = transparent)
+/// Build a vertical linear gradient (top = tinted at .7 alpha, bottom = transparent)
 /// that spans the full frame height. `tint` is whatever theme color the
 /// sparkline picked — accent for popup, panel-foreground for the panel button.
 fn area_gradient(tint: Color, bounds: Rectangle) -> Linear {
-    let top = Color { a: 0.55, ..tint };
+    let top = Color { a: 0.70, ..tint };
     let bottom = Color { a: 0.0, ..tint };
     Linear::new(Point::new(0.0, 0.0), Point::new(0.0, bounds.height))
         .add_stop(0.0, top)
@@ -139,7 +149,7 @@ impl<Message> canvas::Program<Message, Theme> for Sparkline {
         // waiting for a second reading.
         if self.samples.len() == 1 {
             #[allow(clippy::cast_possible_truncation)]
-            let norm = ((self.samples[0] - y_min) / range) as f32;
+            let norm = (((self.samples[0] - y_min) / range) as f32).clamp(0.0, 1.0);
             let tick_y = pad + (1.0 - norm) * usable_h;
 
             let area = Path::new(|p| {
@@ -167,7 +177,7 @@ impl<Message> canvas::Program<Message, Theme> for Sparkline {
             .enumerate()
             .map(|(i, s)| {
                 let x = pad + (i as f32 / (n - 1) as f32) * usable_w;
-                let norm = ((s - y_min) / range) as f32;
+                let norm = (((s - y_min) / range) as f32).clamp(0.0, 1.0);
                 let y = pad + (1.0 - norm) * usable_h;
                 Point::new(x, y)
             })
@@ -256,5 +266,23 @@ mod tests {
     fn with_stroke_alpha_overrides_default() {
         let s = Sparkline::new([1.0, 2.0]).with_stroke_alpha(0.5);
         assert!((s.stroke_alpha - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_finite_sample_is_ignored_falls_back_to_default_band() {
+        // A slice containing only non-finite values should return the same
+        // default band as an empty input.
+        let (min, max) = y_range(&[f64::NAN, f64::INFINITY]);
+        let (emin, emax) = y_range(&[]);
+        assert!(approx(min, emin), "min: got {min}, expected {emin}");
+        assert!(approx(max, emax), "max: got {max}, expected {emax}");
+    }
+
+    #[test]
+    fn non_finite_sample_mixed_with_finite_is_ignored() {
+        // NaN and ±inf must not affect the range computed from the finite values.
+        let (min, max) = y_range(&[f64::NAN, 20.0, f64::INFINITY, 40.0]);
+        assert!(approx(min, 20.0), "min was {min}");
+        assert!(approx(max, 40.0), "max was {max}");
     }
 }
