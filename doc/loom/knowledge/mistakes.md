@@ -42,3 +42,16 @@
 - Background subagents cannot answer permission prompts interactively, so lint verification commands must run in a foreground/main-agent context where prompts can be accepted.
 
 **Detection heuristic:** if a lint claim says "clean" but `just check` was the only evidence, re-run `cargo clippy --all-targets --all-features -- -W clippy::pedantic` and count warnings before asserting.
+
+## Manual version bump without regenerating Cargo.lock broke CI `--locked` (2026-06-12)
+
+**What happened:** `v0.3.1` was cut by hand-editing `version` in `Cargo.toml` (commit `chore: update version for new release`) without regenerating `Cargo.lock`, so the lock's own `liquidmon` package entry still said `0.3.0`. CI runs `cargo build --release --locked`; cargo needs to rewrite the lock to reconcile the two versions, but `--locked` forbids that, so the release build failed with "cannot update the lock file ... because --locked was passed." The local working tree happened to have a regenerated lock, but it was never committed, masking the problem locally.
+
+**Why:** The `liquidmon` package's version appears in BOTH `Cargo.toml` and `Cargo.lock`. A manual `Cargo.toml`-only bump leaves them inconsistent. The inconsistency is invisible to any non-`--locked` cargo command (which silently fixes the lock in place), so it only surfaces in CI.
+
+**Prevention:**
+- Bump releases with `just tag <X.Y.Z>`, not by hand. That recipe edits every `Cargo.toml`, then runs `cargo check` to regenerate `Cargo.lock`, stages the lock, commits `release: <ver>`, and tags. (Note: the recipe does NOT touch `resources/app.metainfo.xml` — add the `<release>` entry separately before committing.)
+- If bumping manually, run `cargo check --locked` afterward as a pre-commit gate — it exits non-zero on exactly the mismatch CI would hit, before you commit.
+- Stage `Cargo.lock` in the same commit as the `Cargo.toml` version change; never let a version bump and its lock update land in separate commits.
+
+**Fix:** Committed the regenerated `Cargo.lock` to sync `0.3.1`, then cut `0.3.2` with `Cargo.toml` + `Cargo.lock` + metainfo in one `release:` commit, verified by `cargo check --locked`, and deleted the stale never-pushed `v0.3.1` tag.
