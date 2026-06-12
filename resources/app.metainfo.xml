@@ -45,4 +45,24 @@
     <keyword>temperature</keyword>
   </keywords>
   <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.3.0" date="2026-05-26">
+      <description>
+        <p>Popup now shows VU-meter equalizer charts for coolant temperature, pump duty, and fan duty. Animated fan and pump glyphs in popup headers. Panel button retains the gradient sparkline trend glyph.</p>
+      </description>
+    </release>
+    <release version="0.2.2" date="2026-05-26" />
+    <release version="0.2.1" date="2026-05-01">
+      <description>
+        <p>Configurable sample interval (1–10 s slider, persisted via cosmic-config). Auto-detected device selection with persistent override dropdown.</p>
+      </description>
+    </release>
+    <release version="0.1.4" date="2026-05-01" />
+    <release version="0.1.2" date="2026-05-01" />
+    <release version="0.1.0" date="2026-04-30">
+      <description>
+        <p>Initial release. Panel button with live temperature, sparkline, fan duty, and pump duty. Popup with per-metric history and per-fan breakdown.</p>
+      </description>
+    </release>
+  </releases>
 </component>

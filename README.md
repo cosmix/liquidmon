@@ -4,9 +4,10 @@ LiquidMon is a COSMIC panel applet that monitors AIO liquid coolers in
 real time via the [`liquidctl`][liquidctl] CLI. The panel button shows the
 current liquid temperature, a gradient-filled sparkline of recent samples,
 average fan duty %, and pump duty %. Clicking it opens a popup with the
-device description, three large 15-minute sparklines (coolant temperature,
-pump duty, fan-average duty), and a slider that sets the sample interval
-(1.0 s – 10.0 s, persisted via cosmic-config).
+device description, three VU-meter equalizer charts (coolant temperature,
+pump duty, fan-average duty) spanning up to 900 samples (~22.5 min at the
+1.5 s default interval, ~15 min at the 1 s minimum), and a slider that sets
+the sample interval (1.0 s – 10.0 s, persisted via cosmic-config).
 
 The applet polls `liquidctl --json status` at the configured interval (default
 1.5 s) with a 3-second per-call timeout. If a poll fails, the last successful
