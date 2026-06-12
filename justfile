@@ -71,14 +71,18 @@ install:
 
 # Uninstalls installed files
 uninstall:
-    rm {{bin-dst}} {{desktop-dst}} {{icon-dst}}
+    rm -f {{bin-dst}} {{desktop-dst}} {{appdata-dst}} {{icon-dst}}
 
 # Vendor dependencies locally
 vendor:
+    #!/usr/bin/env bash
+    set -euo pipefail
     mkdir -p .cargo
-    cargo vendor --sync Cargo.toml | head -n -1 > .cargo/config.toml
-    echo 'directory = "vendor"' >> .cargo/config.toml
-    echo >> .cargo/config.toml
+    _tmp=$(mktemp)
+    cargo vendor --sync Cargo.toml > "$_tmp"
+    sed '$d' "$_tmp" > .cargo/config.toml
+    rm -f "$_tmp"
+    printf 'directory = "vendor"\n\n' >> .cargo/config.toml
     tar pcf vendor.tar vendor .cargo
     rm -rf .cargo vendor
 
@@ -89,9 +93,23 @@ vendor-extract:
 
 # Bump cargo version, create git commit, and create tag
 tag version:
-    find -type f -name Cargo.toml -exec sed -i '0,/^version/s/^version.*/version = "{{version}}"/' '{}' \; -exec git add '{}' \;
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{version}}" in
+      [0-9]*.[0-9]*.[0-9]*)
+        if ! echo "{{version}}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "error: '{{version}}' is not a valid semver X.Y.Z" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "error: '{{version}}' is not a valid semver X.Y.Z" >&2
+        exit 1
+        ;;
+    esac
+    find . -type f -name Cargo.toml -exec sed -i '0,/^version/s/^version.*/version = "{{version}}"/' '{}' \; -exec git add '{}' \;
     cargo check
     cargo clean
     git add Cargo.lock
     git commit -m 'release: {{version}}'
-    git tag -a v{{version}} -m ''
+    git tag -a v{{version}} -m 'Release {{version}}'
