@@ -152,3 +152,133 @@ impl<Message> canvas::Program<Message, Theme> for Equalizer {
         vec![frame.into_geometry()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn approx_f32(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    // --- bin() tests ---
+
+    #[test]
+    fn bin_fewer_samples_than_cols_still_returns_cols_values() {
+        // 3 samples, 5 cols — each output bin is finite and output len == cols.
+        let out = bin(&[1.0, 2.0, 3.0], 5);
+        assert_eq!(out.len(), 5);
+        for v in &out {
+            assert!(v.is_finite(), "bin produced non-finite value: {v}");
+        }
+    }
+
+    #[test]
+    fn bin_samples_equal_cols_returns_same_len() {
+        let samples: Vec<f64> = (1_i32..=4).map(f64::from).collect();
+        let out = bin(&samples, 4);
+        assert_eq!(out.len(), 4);
+        for v in &out {
+            assert!(v.is_finite(), "bin produced non-finite value: {v}");
+        }
+    }
+
+    #[test]
+    fn bin_more_samples_than_cols_returns_cols_len() {
+        let samples: Vec<f64> = (1_i32..=20).map(f64::from).collect();
+        let out = bin(&samples, 4);
+        assert_eq!(out.len(), 4);
+        for v in &out {
+            assert!(v.is_finite(), "bin produced non-finite value: {v}");
+        }
+    }
+
+    #[test]
+    fn bin_single_sample_no_panic_or_nan() {
+        let out = bin(&[42.0], 5);
+        assert_eq!(out.len(), 5);
+        for v in &out {
+            assert!(v.is_finite(), "bin produced non-finite value: {v}");
+        }
+    }
+
+    #[test]
+    fn bin_cols_one_returns_mean_of_all_samples() {
+        let out = bin(&[10.0, 20.0, 30.0], 1);
+        assert_eq!(out.len(), 1);
+        // mean of [10, 20, 30] = 20.0
+        assert!(approx(out[0], 20.0), "expected 20.0, got {}", out[0]);
+    }
+
+    #[test]
+    fn bin_averaging_correctness() {
+        // 8 samples, 2 cols → first bin covers samples[0..4], second covers [4..8].
+        let samples = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let out = bin(&samples, 2);
+        assert_eq!(out.len(), 2);
+        // Hand-computed: bin 0 = (1+2+3+4)/4 = 2.5, bin 1 = (5+6+7+8)/4 = 6.5
+        assert!(approx(out[0], 2.5), "bin 0: expected 2.5, got {}", out[0]);
+        assert!(approx(out[1], 6.5), "bin 1: expected 6.5, got {}", out[1]);
+    }
+
+    // --- segment_color() tests ---
+    // SEGMENTS=10, GREEN_MAX=0.6, AMBER_MAX=0.85.
+    // frac = seg / (SEGMENTS-1) = seg / 9.
+
+    #[test]
+    fn segment_color_lowest_is_green() {
+        // seg=0: frac=0/9=0.0 < GREEN_MAX(0.6) → GREEN
+        let c = segment_color(0);
+        assert!(
+            approx_f32(c.r, GREEN.r) && approx_f32(c.g, GREEN.g) && approx_f32(c.b, GREEN.b),
+            "expected GREEN at seg=0, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn segment_color_boundary_green_to_amber() {
+        // seg=5: frac=5/9≈0.556 → GREEN (below GREEN_MAX=0.6)
+        let c5 = segment_color(5);
+        assert!(
+            approx_f32(c5.r, GREEN.r),
+            "seg=5 should be GREEN, got {c5:?}"
+        );
+        // seg=6: frac=6/9≈0.667 → AMBER (≥ GREEN_MAX, < AMBER_MAX)
+        let c6 = segment_color(6);
+        assert!(
+            approx_f32(c6.r, AMBER.r) && approx_f32(c6.g, AMBER.g),
+            "seg=6 should be AMBER, got {c6:?}"
+        );
+    }
+
+    #[test]
+    fn segment_color_boundary_amber_to_red() {
+        // seg=7: frac=7/9≈0.778 → AMBER (< AMBER_MAX=0.85)
+        let c7 = segment_color(7);
+        assert!(
+            approx_f32(c7.r, AMBER.r) && approx_f32(c7.g, AMBER.g),
+            "seg=7 should be AMBER, got {c7:?}"
+        );
+        // seg=8: frac=8/9≈0.889 → RED (≥ AMBER_MAX)
+        let c8 = segment_color(8);
+        assert!(
+            approx_f32(c8.r, RED.r) && approx_f32(c8.b, RED.b),
+            "seg=8 should be RED, got {c8:?}"
+        );
+    }
+
+    #[test]
+    fn segment_color_topmost_is_red() {
+        // seg=9 (SEGMENTS-1): frac=1.0 → RED
+        let c = segment_color(SEGMENTS - 1);
+        assert!(
+            approx_f32(c.r, RED.r) && approx_f32(c.b, RED.b),
+            "expected RED at seg={}, got {c:?}",
+            SEGMENTS - 1
+        );
+    }
+}

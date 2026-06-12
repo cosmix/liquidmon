@@ -138,3 +138,45 @@ impl<Message> canvas::Program<Message, Theme> for Spinner {
         vec![frame.into_geometry()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_f32(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn zero_rpm_yields_zero_angle() {
+        // clock is non-zero; with zero rpm the angle must be zero regardless.
+        let s = Spinner::new(Kind::Fan, 0, 10.0);
+        assert!(
+            approx_f32(s.angle(), 0.0),
+            "expected 0.0, got {}",
+            s.angle()
+        );
+    }
+
+    #[test]
+    fn angle_scales_linearly_with_clock() {
+        // At fixed rpm, doubling the clock must double the angle (before wrap).
+        let rpm = 1000;
+        let s1 = Spinner::new(Kind::Pump, rpm, 1.0);
+        let s2 = Spinner::new(Kind::Pump, rpm, 2.0);
+        let expected = (s1.angle() * 2.0) % TAU;
+        assert!(
+            approx_f32(s2.angle(), expected),
+            "expected {expected}, got {}",
+            s2.angle()
+        );
+    }
+
+    #[test]
+    fn angle_wraps_modulo_tau() {
+        // A clock value large enough to cause wrap; result must lie in [0, TAU).
+        let s = Spinner::new(Kind::Fan, 2000, 1000.0);
+        let a = s.angle();
+        assert!((0.0..TAU).contains(&a), "angle {a} outside [0, TAU)");
+    }
+}
