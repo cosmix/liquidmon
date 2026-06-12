@@ -18,7 +18,7 @@ jobs:
     name: fmt / clippy / test / build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies
         run: |
@@ -28,13 +28,21 @@ jobs:
             libxkbcommon-dev \
             libwayland-dev \
             libfontconfig1-dev \
-            libfreetype6-dev
+            libfreetype6-dev \
+            desktop-file-utils \
+            appstream
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate desktop entry
+        run: desktop-file-validate resources/app.desktop
+
+      - name: Validate AppStream metainfo
+        run: appstreamcli validate --no-net resources/app.metainfo.xml
+
+      - uses: dtolnay/rust-toolchain@stable # @stable ref selects the stable toolchain; SHA-pinning would require an explicit `toolchain:` input (left mutable by choice)
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -52,9 +60,9 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable # @stable ref selects the stable toolchain; SHA-pinning would require an explicit `toolchain:` input (left mutable by choice)
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: cargo-audit
       - name: Install cargo-audit

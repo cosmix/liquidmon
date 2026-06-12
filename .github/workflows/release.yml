@@ -16,7 +16,7 @@ jobs:
     name: build .deb + tarball
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Verify Cargo.toml version matches tag
         run: |
@@ -39,9 +39,9 @@ jobs:
             libfontconfig1-dev \
             libfreetype6-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable # @stable ref selects the stable toolchain; SHA-pinning would require an explicit `toolchain:` input (left mutable by choice)
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-targets: true
 
@@ -75,7 +75,7 @@ jobs:
           mkdir -p "dist/${stage}"
           cp target/release/liquidmon "dist/${stage}/"
           cp -r resources "dist/${stage}/"
-          cp justfile README.md "dist/${stage}/"
+          cp README.md "dist/${stage}/"
           tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
 
       - name: Collect artifacts
@@ -87,7 +87,7 @@ jobs:
           ( cd artifacts && sha256sum *.tar.gz *.deb > SHA256SUMS )
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             artifacts/*.tar.gz
