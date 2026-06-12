@@ -46,6 +46,11 @@
   </keywords>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.2" date="2026-06-12">
+      <description>
+        <p>Reliability and accuracy fixes: readings now reflect the true polling cadence and recover from transient device-enumeration failures, liquidctl status parsing and error reporting are more robust, and sparklines handle out-of-range and non-finite samples cleanly. The udev-rules installer now pins the liquidctl rules to a tagged release for reproducible setup.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-05-26">
       <description>
         <p>Popup now shows VU-meter equalizer charts for coolant temperature, pump duty, and fan duty. Animated fan and pump glyphs in popup headers. Panel button retains the gradient sparkline trend glyph.</p>
