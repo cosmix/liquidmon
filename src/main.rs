@@ -2,6 +2,9 @@
 
 mod app;
 mod config;
+mod control;
+mod control_view;
+mod curve;
 mod devices;
 mod equalizer;
 mod liquidctl;

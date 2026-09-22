@@ -127,18 +127,13 @@ struct StatusEntry {
     unit: String,
 }
 
-/// Runs `liquidctl --match <match_filter> --json status`, parses the first
-/// device with a non-empty `status` array, and returns its parsed AioStatus.
-pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
-    // The 3 s timeout below clocks only AFTER this lock is acquired, so the
-    // bound is per-subprocess, not end-to-end: a call queued behind a slow
-    // in-flight call can take lock-wait + timeout total. The two timeouts do
-    // not compose under contention by design (we don't time out lock-wait).
-    let _guard = LIQUIDCTL_LOCK.lock().await;
+/// Runs `liquidctl` with `args`, assuming the caller already holds
+/// `LIQUIDCTL_LOCK`. Handles kill-on-drop, the per-subprocess timeout,
+/// exit-code checking and UTF-8 decoding; returns stdout on success.
+async fn run_liquidctl_locked(args: &[&str], timeout: Duration) -> Result<String, Error> {
     let mut cmd = Command::new("liquidctl");
-    cmd.args(["--match", match_filter, "--json", "status"])
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(3), cmd.output())
+    cmd.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, cmd.output())
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(Error::Spawn)?;
@@ -156,7 +151,29 @@ pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
             format!("liquidctl produced non-UTF-8 stdout: {e}"),
         ))
     })?;
-    parse_status_response(raw)
+    Ok(raw.to_string())
+}
+
+/// Run `liquidctl` with `args` under the global serialization lock and
+/// return stdout. `timeout` is per-subprocess and clocks only after the
+/// lock is acquired, so the bound is per-subprocess, not end-to-end: a call
+/// queued behind a slow in-flight call can take lock-wait + timeout total.
+/// The two timeouts do not compose under contention by design (we don't
+/// time out lock-wait).
+async fn run_liquidctl(args: &[&str], timeout: Duration) -> Result<String, Error> {
+    let _guard = LIQUIDCTL_LOCK.lock().await;
+    run_liquidctl_locked(args, timeout).await
+}
+
+/// Runs `liquidctl --match <match_filter> --json status`, parses the first
+/// device with a non-empty `status` array, and returns its parsed AioStatus.
+pub async fn fetch_status(match_filter: &str) -> Result<AioStatus, Error> {
+    let raw = run_liquidctl(
+        &["--match", match_filter, "--json", "status"],
+        Duration::from_secs(3),
+    )
+    .await?;
+    parse_status_response(&raw)
 }
 
 /// Parses raw `liquidctl --json status` output and returns the first device
@@ -257,32 +274,8 @@ fn split_fan_key(rest: &str) -> Option<(u8, &str)> {
 /// A 1 s timeout is used — `list` is purely an HID enumeration with no
 /// on-device transaction, so 3 s is unnecessarily generous.
 pub async fn list_devices() -> Result<Vec<DetectedDevice>, Error> {
-    // The 1 s timeout below clocks only AFTER this lock is acquired, so the
-    // bound is per-subprocess, not end-to-end: a call queued behind a slow
-    // in-flight call can take lock-wait + timeout total. The two timeouts do
-    // not compose under contention by design (we don't time out lock-wait).
-    let _guard = LIQUIDCTL_LOCK.lock().await;
-    let mut cmd = Command::new("liquidctl");
-    cmd.args(["list", "--json"]).kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(1), cmd.output())
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(Error::Spawn)?;
-
-    if !output.status.success() {
-        return Err(Error::NonZeroExit {
-            status: output.status.code(),
-            stderr: last_lines(&String::from_utf8_lossy(&output.stderr), 4),
-        });
-    }
-
-    let raw = std::str::from_utf8(&output.stdout).map_err(|e| {
-        Error::Spawn(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("liquidctl produced non-UTF-8 stdout: {e}"),
-        ))
-    })?;
-    parse_devices_response(raw)
+    let raw = run_liquidctl(&["list", "--json"], Duration::from_secs(1)).await?;
+    parse_devices_response(&raw)
 }
 
 /// Parses raw `liquidctl list --json` output into a list of [`DetectedDevice`].
@@ -326,6 +319,21 @@ fn deserialize_string_lossy<'de, D: serde::Deserializer<'de>>(d: D) -> Result<St
         serde_json::Value::Number(n) => n.to_string(),
         _ => String::new(),
     })
+}
+
+/// Apply an ordered list of control invocations, stopping at the first
+/// failure. Holds the lock across the whole sequence so a status poll
+/// cannot interleave between the fan write and the pump write (the
+/// payload-clobber trap — see PLAN-cooling-controls.md). Each step's
+/// stdout is discarded: `liquidctl set`/`initialize` report success only
+/// via exit code 0.
+pub async fn apply_control(steps: Vec<Vec<String>>) -> Result<(), Error> {
+    let _guard = LIQUIDCTL_LOCK.lock().await;
+    for step in &steps {
+        let args: Vec<&str> = step.iter().map(String::as_str).collect();
+        run_liquidctl_locked(&args, Duration::from_secs(5)).await?;
+    }
+    Ok(())
 }
 
 /// Keeps only the last `n` non-empty lines of `s`, joined with newlines.

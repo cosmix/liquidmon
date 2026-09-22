@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::config::Config;
+use crate::control;
+use crate::control_view;
 use crate::devices;
 use crate::liquidctl::DetectedDevice;
 use crate::sparkline::{Sparkline, SparklineTint};
@@ -15,10 +17,12 @@ use cosmic::iced::{Alignment, Length, Limits, Subscription, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
 use cosmic::widget::autosize;
+use cosmic::widget::segmented_button;
 use futures_util::SinkExt;
 use std::collections::VecDeque;
 use std::sync::LazyLock;
 use std::time::Duration;
+use std::time::Instant;
 
 static AUTOSIZE_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("liquidmon-applet"));
 
@@ -31,6 +35,36 @@ const MAX_INTERVAL_MS: u64 = 10000;
 /// subscription interval and the per-tick `anim_t` advance, so the clock
 /// stays consistent with the wall-clock tick rate from a single source.
 const ANIM_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Consecutive diverging status samples required before an automatic write.
+/// Two, so a single transient — a sample taken mid-ramp, or right after a
+/// resume — cannot trigger one.
+const DIVERGENT_SAMPLES_REQUIRED: u8 = 2;
+
+/// Build the stateful model behind the manual pump segmented control: three
+/// entities carrying their `PumpMode` as data, with `initial` activated.
+fn build_pump_model(initial: control::PumpMode) -> segmented_button::SingleSelectModel {
+    let mut model = segmented_button::SingleSelectModel::builder()
+        .insert(|b| b.text("Quiet").data(control::PumpMode::Quiet))
+        .insert(|b| b.text("Balanced").data(control::PumpMode::Balanced))
+        .insert(|b| b.text("Extreme").data(control::PumpMode::Extreme))
+        .build();
+    activate_pump_mode(&mut model, initial);
+    model
+}
+
+/// Move the segmented control's selection onto `mode`. The model is stateful
+/// and cannot be rebuilt per render, so every path that changes the pump mode
+/// — the initial load, `ManualPumpSelected`, an external `UpdateConfig` —
+/// must call this or the segments render without the selection ever moving.
+fn activate_pump_mode(model: &mut segmented_button::SingleSelectModel, mode: control::PumpMode) {
+    let entity = model
+        .iter()
+        .find(|entity| model.data::<control::PumpMode>(*entity) == Some(&mode));
+    if let Some(entity) = entity {
+        model.activate(entity);
+    }
+}
 
 fn fan_duty_avg(fans: &[crate::liquidctl::Fan]) -> Option<u8> {
     if fans.is_empty() {
@@ -129,6 +163,37 @@ pub struct AppModel {
     /// failing `liquidctl list` cannot spin in a tight loop — it fires at most
     /// once until a device becomes known.
     enumeration_retried: bool,
+    /// Manual-slider value while mid-drag; `None` outside a drag. Mirrors
+    /// `pending_interval_secs` so the value only commits on release.
+    pending_fan_duty: Option<f32>,
+    /// True while an apply subprocess sequence is in flight.
+    apply_in_flight: bool,
+    /// Latest settings requested while an apply was in flight. Coalesces a
+    /// burst of gestures into one follow-up write instead of a queue.
+    apply_queued: bool,
+    /// What the in-flight apply is putting on the device. The per-boot marker
+    /// is stamped from this rather than from the live config, so a gesture or
+    /// an external config change arriving mid-write cannot make the marker
+    /// claim settings the device never received.
+    applying_settings: Option<control::Settings>,
+    /// Device the automatic write budget for this run has been spent on.
+    /// Set when an automatic apply is *dispatched*, so one failing device
+    /// cannot spin. Cleared only when the effective device changes.
+    auto_applied_for: Option<String>,
+    /// Device whose per-boot marker has already been read this run. The
+    /// marker is file IO and the poll runs every 1.5 s, so it is consulted
+    /// once per device per run rather than on every tick.
+    marker_checked_for: Option<String>,
+    /// Consecutive status samples that contradicted the active setting.
+    /// An automatic write needs two; any matching sample resets it to 0.
+    divergent_samples: u8,
+    /// Outcome of the last apply plus the session write count, rendered as the
+    /// status line under the controls.
+    last_apply: control::ApplyStatus,
+    /// Stateful model behind the manual pump segmented control. Built in
+    /// `init`; `activate()` must be called on every path that changes the
+    /// pump mode, or the segments render without moving the selection.
+    pump_model: segmented_button::SingleSelectModel,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -153,6 +218,25 @@ pub enum Message {
     DeviceSelected(Option<String>),
     /// Animation frame tick — advances the spinner clock while the popup is open.
     AnimationTick,
+    /// User picked an entry in the cooling-mode dropdown.
+    ControlModeSelected(control::ControlMode),
+    /// Fired continuously while the manual fan slider is dragged.
+    ManualFanDragged(f32),
+    /// Fired once on release — clamps, persists, and dispatches an apply.
+    ManualFanReleased,
+    /// User picked a pump mode in manual mode.
+    ManualPumpSelected(control::PumpMode),
+    /// User pressed "Apply now" — writes unconditionally, bypassing both the
+    /// per-boot marker and the divergence check.
+    ApplyRequested,
+    /// User toggled automatic re-apply.
+    AutoReapplyToggled(bool),
+    /// Result of an apply, paired with the match string that started it so a
+    /// late result from a previous device is ignored (same guard as `StatusTick`).
+    ControlApplied {
+        match_str: String,
+        result: Result<(), String>,
+    },
 }
 
 /// Create a COSMIC application from the app model
@@ -195,6 +279,9 @@ impl cosmic::Application for AppModel {
 
         let app = AppModel {
             core,
+            // The segmented control is stateful, so the saved pump mode has to
+            // be activated on it here — a render alone never moves it.
+            pump_model: build_pump_model(config.manual_pump_mode),
             config,
             config_handle,
             device_scan_in_flight: true,
@@ -377,6 +464,10 @@ impl cosmic::Application for AppModel {
                 if prev_effective != new_effective {
                     self.reset_device_state();
                 }
+                // An external config change is not a user gesture, so it never
+                // dispatches a write — but the segmented control is stateful
+                // and would otherwise keep showing the old pump mode.
+                activate_pump_mode(&mut self.pump_model, self.config.manual_pump_mode);
             }
             Message::StatusTick { match_str, result } => {
                 if self.effective_match().as_deref() != Some(match_str.as_str()) {
@@ -395,6 +486,9 @@ impl cosmic::Application for AppModel {
 
                         self.last_status = Some(status);
                         self.last_error = None;
+                        // A status sample is the only automatic trigger for a
+                        // write, and only through the divergence check.
+                        return self.evaluate_divergence(&match_str);
                     }
                     Err(msg) => {
                         self.last_error = Some(msg);
@@ -419,6 +513,7 @@ impl cosmic::Application for AppModel {
                     // Closing mid-drag: drop any half-dragged slider value so the
                     // next open shows the persisted setting, not a stale value.
                     self.pending_interval_secs = None;
+                    self.pending_fan_duty = None;
                     destroy_popup(p)
                 } else {
                     let Some(parent) = self.core.main_window_id() else {
@@ -455,6 +550,7 @@ impl cosmic::Application for AppModel {
                     // Compositor-driven close (Esc / outside click) also skips
                     // slider release, so clear any staged drag value here too.
                     self.pending_interval_secs = None;
+                    self.pending_fan_duty = None;
                 }
             }
             Message::DevicesEnumerated(Ok(devs)) => {
@@ -496,9 +592,56 @@ impl cosmic::Application for AppModel {
                     if prev_effective != new_effective {
                         self.reset_device_state();
                     }
-                    if let Some(handle) = self.config_handle.as_ref() {
-                        let _ = self.config.write_entry(handle);
-                    }
+                    self.persist_config();
+                }
+            }
+            Message::ControlModeSelected(mode) => {
+                self.config.control_mode = mode;
+                // `Preset(p)` and the remembered preset always agree, so a
+                // Manual or Unmanaged detour returns to the same curve.
+                if let control::ControlMode::Preset(preset) = mode {
+                    self.config.control_preset = preset;
+                }
+                self.persist_config();
+                // A user gesture writes unconditionally; `Unmanaged` builds no
+                // steps, so picking it dispatches nothing.
+                return self.dispatch_apply(control::ApplyTrigger::User);
+            }
+            Message::ManualFanDragged(duty) => {
+                self.pending_fan_duty = Some(duty);
+            }
+            Message::ManualFanReleased => {
+                if self.commit_pending_fan_duty() {
+                    return self.dispatch_apply(control::ApplyTrigger::User);
+                }
+            }
+            Message::ManualPumpSelected(mode) => {
+                self.config.manual_pump_mode = mode;
+                activate_pump_mode(&mut self.pump_model, mode);
+                self.persist_config();
+                return self.dispatch_apply(control::ApplyTrigger::User);
+            }
+            Message::ApplyRequested => {
+                return self.dispatch_apply(control::ApplyTrigger::User);
+            }
+            Message::AutoReapplyToggled(enabled) => {
+                // Toggling the policy is not itself a write: turning it on
+                // lets the divergence check act, nothing more.
+                self.config.auto_reapply = enabled;
+                self.persist_config();
+            }
+            Message::ControlApplied { match_str, result } => {
+                if self.effective_match().as_deref() != Some(match_str.as_str()) {
+                    return Task::none();
+                }
+                self.apply_in_flight = false;
+                self.record_apply_result(result);
+                // Drain the coalesced gesture, if any: exactly one follow-up
+                // write with the settings as they stand now. Nothing else
+                // reads the flag, so it can never queue more than one.
+                if self.apply_queued {
+                    self.apply_queued = false;
+                    return self.dispatch_apply(control::ApplyTrigger::User);
                 }
             }
         }
@@ -564,6 +707,15 @@ impl AppModel {
             sections.push(view::fan_rows(status));
         }
         sections.push(widget::divider::horizontal::default().into());
+        sections.push(control_view::control_section(
+            &self.settings(),
+            control::capability(&status.description),
+            self.pending_fan_duty,
+            status.liquid_temp_c,
+            self.apply_in_flight,
+            &self.last_apply,
+            &self.pump_model,
+        ));
         sections.push(view::interval_control(
             self.pending_interval_secs,
             self.config.sample_interval_ms,
@@ -587,12 +739,24 @@ impl AppModel {
 
     /// Clear all per-device state when the effective device changes so
     /// sparklines and last-status reflect only samples from the new device.
+    /// The write budget, the marker check and the divergence counter all
+    /// follow the effective device, so they are cleared here too.
     fn reset_device_state(&mut self) {
         self.temp_history.clear();
         self.pump_duty_history.clear();
         self.fan_avg_duty_history.clear();
         self.last_status = None;
         self.last_error = None;
+        self.auto_applied_for = None;
+        self.marker_checked_for = None;
+        self.divergent_samples = 0;
+        // A result for the old device is dropped by the `match_str` guard, so
+        // the in-flight state has to be released here or the controls would
+        // stay stuck on "Applying…" with every later gesture merely queued.
+        // The write itself is unaffected: liquidctl.rs serializes on its lock.
+        self.apply_in_flight = false;
+        self.apply_queued = false;
+        self.applying_settings = None;
     }
 
     /// Resolve the effective `--match` filter: user's saved choice takes
@@ -622,10 +786,189 @@ impl AppModel {
         let ms = ms_f as u64;
         if ms != self.config.sample_interval_ms {
             self.config.sample_interval_ms = ms;
-            if let Some(handle) = self.config_handle.as_ref() {
-                let _ = self.config.write_entry(handle);
+            self.persist_config();
+        }
+    }
+
+    /// Persist the current config to cosmic-config. Best effort: the handle is
+    /// `None` when the config service was unavailable at startup.
+    fn persist_config(&self) {
+        if let Some(handle) = self.config_handle.as_ref() {
+            let _ = self.config.write_entry(handle);
+        }
+    }
+
+    /// The desired device state, rebuilt from the persisted config. A
+    /// mid-drag `pending_fan_duty` is deliberately absent: only committed
+    /// values ever reach the device.
+    fn settings(&self) -> control::Settings {
+        control::Settings {
+            mode: self.config.control_mode,
+            preset: self.config.control_preset,
+            manual_fan_duty: self.config.manual_fan_duty,
+            manual_pump_mode: self.config.manual_pump_mode,
+            auto_reapply: self.config.auto_reapply,
+        }
+    }
+
+    /// Device description used for capability classification and the per-boot
+    /// marker: what liquidctl reported, falling back to the effective
+    /// `--match` filter before the first status sample lands.
+    fn device_description(&self) -> Option<String> {
+        self.last_status
+            .as_ref()
+            .map(|status| status.description.clone())
+            .or_else(|| self.effective_match())
+    }
+
+    /// Apply the staged manual fan-duty value, clamp it to the supported
+    /// range, and persist. Returns whether a drag was actually staged, so a
+    /// release without one dispatches nothing.
+    fn commit_pending_fan_duty(&mut self) -> bool {
+        let Some(duty) = self.pending_fan_duty.take() else {
+            return false;
+        };
+        let clamped = duty.round().clamp(
+            f32::from(control::MIN_FAN_DUTY),
+            f32::from(control::MAX_FAN_DUTY),
+        );
+        // Cast is safe: the clamp above pulls `clamped` into
+        // [MIN_FAN_DUTY, MAX_FAN_DUTY] ⊂ u8 before we narrow.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let duty = clamped as u8;
+        if duty != self.config.manual_fan_duty {
+            self.config.manual_fan_duty = duty;
+            self.persist_config();
+        }
+        true
+    }
+
+    /// Build and dispatch an apply for the current settings. No-ops when the
+    /// mode is `Unmanaged`, no device is selected, or the device's family has
+    /// no verified write path. Coalesces when one is already in flight.
+    /// `trigger` records whether this came from the user or from divergence;
+    /// only an automatic apply spends the per-run budget.
+    fn dispatch_apply(&mut self, trigger: control::ApplyTrigger) -> Task<cosmic::Action<Message>> {
+        let (Some(match_str), Some(description)) =
+            (self.effective_match(), self.device_description())
+        else {
+            return Task::none();
+        };
+        let settings = self.settings();
+        let Some(steps) =
+            control::apply_steps(&match_str, &settings, control::capability(&description))
+        else {
+            return Task::none();
+        };
+
+        // The budget is spent on dispatch, not on success, so a device that
+        // rejects every write is asked exactly once per run.
+        if matches!(trigger, control::ApplyTrigger::Divergence) {
+            self.auto_applied_for = Some(match_str.clone());
+        }
+        if self.apply_in_flight {
+            self.apply_queued = true;
+            return Task::none();
+        }
+        self.apply_in_flight = true;
+        // Hold on to what this write actually puts on the device: the marker
+        // must record what was sent, not what the config says when the result
+        // lands — a gesture or an external config change can land in between.
+        self.applying_settings = Some(settings);
+
+        Task::perform(
+            async move {
+                crate::liquidctl::apply_control(steps)
+                    .await
+                    .map_err(|e| format!("{e}"))
+            },
+            move |result| {
+                cosmic::Action::App(Message::ControlApplied {
+                    match_str: match_str.clone(),
+                    result,
+                })
+            },
+        )
+    }
+
+    /// Record the outcome of a finished apply. A success advances the session
+    /// write count, clears the divergence counter and stamps the per-boot
+    /// marker; a failure keeps the stderr tail and leaves the marker alone, so
+    /// the next run still checks for divergence.
+    fn record_apply_result(&mut self, result: Result<(), String>) {
+        let applied = self.applying_settings.take();
+        let writes = match self.last_apply {
+            control::ApplyStatus::Never => 0,
+            control::ApplyStatus::Ok { writes, .. }
+            | control::ApplyStatus::Failed { writes, .. } => writes,
+        };
+        match result {
+            Ok(()) => {
+                self.last_apply = control::ApplyStatus::Ok {
+                    at: Instant::now(),
+                    writes: writes.saturating_add(1),
+                };
+                self.divergent_samples = 0;
+                if let (Some(dir), Some(description), Some(applied)) =
+                    (control::marker_dir(), self.device_description(), applied)
+                {
+                    control::write_marker(&dir, &description, &applied);
+                }
+            }
+            Err(stderr) => {
+                self.last_apply = control::ApplyStatus::Failed { stderr, writes };
             }
         }
+    }
+
+    /// The one automatic write path: feed a fresh status sample to the
+    /// divergence check and dispatch at most one apply per device per run.
+    /// Returns without touching anything when the mode is `Unmanaged`,
+    /// automatic re-apply is off, the budget is already spent, or the device
+    /// has no verified write path.
+    fn evaluate_divergence(&mut self, match_str: &str) -> Task<cosmic::Action<Message>> {
+        let settings = self.settings();
+        if matches!(settings.mode, control::ControlMode::Unmanaged)
+            || !settings.auto_reapply
+            || self.auto_applied_for.as_deref() == Some(match_str)
+        {
+            return Task::none();
+        }
+        let Some(status) = self.last_status.as_ref() else {
+            return Task::none();
+        };
+        let description = status.description.clone();
+        if matches!(control::capability(&description), control::Capability::None) {
+            return Task::none();
+        }
+        let diverged = control::diverges(&settings, status);
+
+        // The per-boot marker is read once per device per run: it is file IO
+        // and the poll runs every 1.5 s. A match means this boot already
+        // applied these settings, so the budget is spent with no write.
+        if self.marker_checked_for.as_deref() != Some(match_str) {
+            self.marker_checked_for = Some(match_str.to_string());
+            if control::marker_dir()
+                .is_some_and(|dir| control::marker_matches(&dir, &description, &settings))
+            {
+                self.auto_applied_for = Some(match_str.to_string());
+                return Task::none();
+            }
+        }
+
+        match diverged {
+            Some(true) => {
+                self.divergent_samples = self.divergent_samples.saturating_add(1);
+                if self.divergent_samples >= DIVERGENT_SAMPLES_REQUIRED {
+                    return self.dispatch_apply(control::ApplyTrigger::Divergence);
+                }
+            }
+            // Any sample that matches the desired state resets the run of
+            // divergent ones — two must be consecutive.
+            Some(false) => self.divergent_samples = 0,
+            None => {}
+        }
+        Task::none()
     }
 }
 
@@ -903,6 +1246,7 @@ mod tests {
         let new_cfg = Config {
             sample_interval_ms: 5000,
             device_match: None,
+            ..Config::default()
         };
         let _ = model.update(Message::UpdateConfig(new_cfg));
         assert_eq!(model.config.sample_interval_ms, 5000);
@@ -926,6 +1270,7 @@ mod tests {
         let new_cfg = Config {
             sample_interval_ms: 2000,
             device_match: Some("Corsair Hydro H150i Pro XT".to_string()),
+            ..Config::default()
         };
         let _ = model.update(Message::UpdateConfig(new_cfg));
         assert_eq!(
@@ -945,6 +1290,7 @@ mod tests {
         let _ = model.update(Message::UpdateConfig(Config {
             sample_interval_ms: 2500,
             device_match: Some("Corsair iCUE Hbar".to_string()),
+            ..Config::default()
         }));
 
         assert!(model.temp_history.is_empty());
@@ -965,6 +1311,7 @@ mod tests {
         let _ = model.update(Message::UpdateConfig(Config {
             sample_interval_ms: 2500,
             device_match: Some(TEST_MATCH.to_string()),
+            ..Config::default()
         }));
 
         assert_eq!(model.temp_history.len(), 1);
@@ -1191,6 +1538,13 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.sample_interval_ms, 1500);
         assert_eq!(cfg.device_match, None);
+        // A v3 config opening as v4 gains these, so an upgrade never starts
+        // writing to hardware on its own.
+        assert_eq!(cfg.control_mode, control::ControlMode::Unmanaged);
+        assert_eq!(cfg.control_preset, control::Preset::Balanced);
+        assert_eq!(cfg.manual_fan_duty, 50);
+        assert_eq!(cfg.manual_pump_mode, control::PumpMode::Balanced);
+        assert!(cfg.auto_reapply);
     }
 
     #[test]
@@ -1221,5 +1575,418 @@ mod tests {
 
         assert!(model.popup.is_none());
         assert_eq!(model.pending_interval_secs, None);
+    }
+
+    /// A description `control::capability` classifies as controllable (it
+    /// carries "pro xt") but that no real cooler reports, so a per-boot marker
+    /// left in `$XDG_RUNTIME_DIR` by a real run can never match a test's.
+    const CONTROL_MATCH: &str = "Corsair Hydro H999i Pro XT";
+
+    fn controllable_model(mode: control::ControlMode) -> AppModel {
+        AppModel {
+            config: Config {
+                device_match: Some(CONTROL_MATCH.to_string()),
+                control_mode: mode,
+                control_preset: match mode {
+                    control::ControlMode::Preset(preset) => preset,
+                    _ => control::Preset::Balanced,
+                },
+                ..Config::default()
+            },
+            pump_model: build_pump_model(control::PumpMode::Balanced),
+            ..AppModel::default()
+        }
+    }
+
+    /// A status sample from the controllable device with every fan at `duty_pct`.
+    fn control_status(temp_c: f64, duty_pct: u8) -> AioStatus {
+        AioStatus {
+            description: CONTROL_MATCH.to_string(),
+            liquid_temp_c: temp_c,
+            pump: Pump {
+                speed_rpm: 2000,
+                duty_pct: 70,
+            },
+            fans: vec![fan(1, duty_pct), fan(2, duty_pct), fan(3, duty_pct)],
+        }
+    }
+
+    /// A sample the Balanced curve agrees with: it reads 35% at 30 °C.
+    fn converged_tick() -> Message {
+        status_tick(CONTROL_MATCH, Ok(control_status(30.0, 35)))
+    }
+
+    /// A sample contradicting the Balanced curve by far more than the
+    /// tolerance: 100% where the curve asks for 35%.
+    fn diverging_tick() -> Message {
+        status_tick(CONTROL_MATCH, Ok(control_status(30.0, 100)))
+    }
+
+    fn active_pump_mode(model: &segmented_button::SingleSelectModel) -> Option<control::PumpMode> {
+        model.active_data::<control::PumpMode>().copied()
+    }
+
+    #[test]
+    fn control_mode_selected_persists_and_dispatches() {
+        let mut model = controllable_model(control::ControlMode::Unmanaged);
+
+        let _ = model.update(Message::ControlModeSelected(control::ControlMode::Preset(
+            control::Preset::Performance,
+        )));
+
+        assert_eq!(
+            model.config.control_mode,
+            control::ControlMode::Preset(control::Preset::Performance),
+        );
+        // The remembered preset follows the mode, so a Manual detour and back
+        // returns to the same curve.
+        assert_eq!(model.config.control_preset, control::Preset::Performance);
+        assert!(model.apply_in_flight);
+    }
+
+    #[test]
+    fn control_mode_selected_unmanaged_dispatches_nothing() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+
+        let _ = model.update(Message::ControlModeSelected(
+            control::ControlMode::Unmanaged,
+        ));
+
+        assert_eq!(model.config.control_mode, control::ControlMode::Unmanaged);
+        assert!(!model.apply_in_flight);
+    }
+
+    #[test]
+    fn manual_fan_dragged_stages_without_persisting() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+
+        let _ = model.update(Message::ManualFanDragged(75.0));
+
+        assert_eq!(model.pending_fan_duty, Some(75.0));
+        assert_eq!(model.config.manual_fan_duty, 50);
+        assert!(!model.apply_in_flight);
+    }
+
+    #[test]
+    fn manual_fan_released_clamps_persists_and_dispatches() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+        let _ = model.update(Message::ManualFanDragged(5.0));
+        let _ = model.update(Message::ManualFanReleased);
+        assert_eq!(model.config.manual_fan_duty, control::MIN_FAN_DUTY);
+        assert_eq!(model.pending_fan_duty, None);
+        assert!(model.apply_in_flight);
+
+        let mut model = controllable_model(control::ControlMode::Manual);
+        let _ = model.update(Message::ManualFanDragged(250.0));
+        let _ = model.update(Message::ManualFanReleased);
+        assert_eq!(model.config.manual_fan_duty, control::MAX_FAN_DUTY);
+    }
+
+    #[test]
+    fn manual_fan_released_without_drag_is_noop() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+
+        let _ = model.update(Message::ManualFanReleased);
+
+        assert_eq!(model.config.manual_fan_duty, 50);
+        assert!(!model.apply_in_flight);
+    }
+
+    #[test]
+    fn manual_pump_selected_activates_the_segment_and_persists() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+
+        let _ = model.update(Message::ManualPumpSelected(control::PumpMode::Extreme));
+
+        assert_eq!(model.config.manual_pump_mode, control::PumpMode::Extreme);
+        // The segmented model is stateful: without the activate call the
+        // segments render but the selection never moves.
+        assert_eq!(
+            active_pump_mode(&model.pump_model),
+            Some(control::PumpMode::Extreme),
+        );
+        assert!(model.apply_in_flight);
+    }
+
+    #[test]
+    fn update_config_moves_the_pump_segment_without_writing() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+
+        let _ = model.update(Message::UpdateConfig(Config {
+            device_match: Some(CONTROL_MATCH.to_string()),
+            control_mode: control::ControlMode::Manual,
+            manual_pump_mode: control::PumpMode::Quiet,
+            ..Config::default()
+        }));
+
+        assert_eq!(
+            active_pump_mode(&model.pump_model),
+            Some(control::PumpMode::Quiet),
+        );
+        assert!(!model.apply_in_flight);
+    }
+
+    #[test]
+    fn control_applied_from_stale_match_is_ignored() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+        model.apply_in_flight = true;
+
+        let _ = model.update(Message::ControlApplied {
+            match_str: "Corsair iCUE Hbar".to_string(),
+            result: Err("boom".to_string()),
+        });
+
+        assert!(
+            model.apply_in_flight,
+            "a late result from another device must not clear the flag",
+        );
+        assert!(matches!(model.last_apply, control::ApplyStatus::Never));
+    }
+
+    #[test]
+    fn control_applied_error_records_failure_and_clears_in_flight() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+        model.apply_in_flight = true;
+
+        let _ = model.update(Message::ControlApplied {
+            match_str: CONTROL_MATCH.to_string(),
+            result: Err("liquidctl: no device matches the given filters".to_string()),
+        });
+
+        assert!(!model.apply_in_flight);
+        match &model.last_apply {
+            control::ApplyStatus::Failed { stderr, writes } => {
+                assert_eq!(stderr, "liquidctl: no device matches the given filters");
+                // A failed attempt is not a write.
+                assert_eq!(*writes, 0);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_applied_success_increments_the_session_write_count() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+
+        for _ in 0..2 {
+            model.apply_in_flight = true;
+            let _ = model.update(Message::ControlApplied {
+                match_str: CONTROL_MATCH.to_string(),
+                result: Ok(()),
+            });
+        }
+
+        match &model.last_apply {
+            control::ApplyStatus::Ok { writes, .. } => assert_eq!(*writes, 2),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        assert!(model.applying_settings.is_none());
+    }
+
+    #[test]
+    fn device_change_releases_the_in_flight_apply() {
+        // A result for the old device is dropped by the match guard, so the
+        // flag has to be released here or every later gesture only queues.
+        let mut model = controllable_model(control::ControlMode::Manual);
+        let _ = model.update(Message::ApplyRequested);
+        assert!(model.apply_in_flight);
+
+        let _ = model.update(Message::DeviceSelected(Some(
+            "Corsair Hydro H998i Platinum".to_string(),
+        )));
+        assert!(!model.apply_in_flight);
+        assert!(!model.apply_queued);
+        assert!(model.applying_settings.is_none());
+
+        // A gesture on the new device dispatches rather than queueing.
+        let _ = model.update(Message::ApplyRequested);
+        assert!(model.apply_in_flight);
+        assert!(!model.apply_queued);
+    }
+
+    #[test]
+    fn a_gesture_during_an_apply_queues_exactly_one_follow_up() {
+        let mut model = controllable_model(control::ControlMode::Manual);
+        let _ = model.update(Message::ApplyRequested);
+        assert!(model.apply_in_flight);
+
+        let _ = model.update(Message::ApplyRequested);
+        let _ = model.update(Message::ApplyRequested);
+        assert!(
+            model.apply_queued,
+            "a gesture mid-write sets the flag instead of stacking tasks",
+        );
+
+        // Draining it dispatches exactly one more apply and clears the flag.
+        let _ = model.update(Message::ControlApplied {
+            match_str: CONTROL_MATCH.to_string(),
+            result: Err("boom".to_string()),
+        });
+        assert!(model.apply_in_flight);
+        assert!(!model.apply_queued);
+    }
+
+    #[test]
+    fn devices_enumerated_dispatches_no_apply() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+
+        let _ = model.update(Message::DevicesEnumerated(Ok(vec![detected(
+            CONTROL_MATCH,
+        )])));
+
+        assert!(!model.apply_in_flight);
+        assert_eq!(model.auto_applied_for, None);
+    }
+
+    #[test]
+    fn device_selected_dispatches_no_apply() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+
+        let _ = model.update(Message::DeviceSelected(Some(
+            "Corsair Hydro H998i Platinum".to_string(),
+        )));
+
+        assert!(!model.apply_in_flight);
+        assert_eq!(model.auto_applied_for, None);
+    }
+
+    #[test]
+    fn single_diverging_tick_dispatches_nothing() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+
+        let _ = model.update(diverging_tick());
+
+        assert_eq!(model.divergent_samples, 1);
+        assert!(!model.apply_in_flight);
+        assert_eq!(model.auto_applied_for, None);
+    }
+
+    #[test]
+    fn two_consecutive_diverging_ticks_dispatch_one_apply() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+
+        let _ = model.update(diverging_tick());
+        let _ = model.update(diverging_tick());
+
+        assert!(model.apply_in_flight);
+        assert_eq!(model.auto_applied_for.as_deref(), Some(CONTROL_MATCH));
+
+        // The budget is spent: further divergence neither dispatches nor queues.
+        let _ = model.update(diverging_tick());
+        assert!(!model.apply_queued);
+    }
+
+    #[test]
+    fn matching_sample_between_diverging_ones_resets_the_counter() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+
+        let _ = model.update(diverging_tick());
+        let _ = model.update(converged_tick());
+        assert_eq!(model.divergent_samples, 0);
+
+        let _ = model.update(diverging_tick());
+        assert_eq!(model.divergent_samples, 1);
+        assert!(!model.apply_in_flight);
+    }
+
+    #[test]
+    fn auto_apply_budget_holds_for_the_same_device() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+        let _ = model.update(diverging_tick());
+        let _ = model.update(diverging_tick());
+        // Even a rejected write spends the budget: it is set on dispatch, so a
+        // device that fails every write is asked exactly once.
+        let _ = model.update(Message::ControlApplied {
+            match_str: CONTROL_MATCH.to_string(),
+            result: Err("boom".to_string()),
+        });
+        assert!(!model.apply_in_flight);
+
+        for _ in 0..4 {
+            let _ = model.update(diverging_tick());
+        }
+
+        assert!(
+            !model.apply_in_flight,
+            "one automatic write per run per device",
+        );
+        assert!(!model.apply_queued);
+    }
+
+    #[test]
+    fn device_change_clears_the_auto_apply_budget() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+        let _ = model.update(diverging_tick());
+        let _ = model.update(diverging_tick());
+        assert_eq!(model.auto_applied_for.as_deref(), Some(CONTROL_MATCH));
+
+        let _ = model.update(Message::DeviceSelected(Some(
+            "Corsair Hydro H998i Platinum".to_string(),
+        )));
+
+        assert_eq!(model.auto_applied_for, None);
+        assert_eq!(model.marker_checked_for, None);
+        assert_eq!(model.divergent_samples, 0);
+    }
+
+    #[test]
+    fn auto_reapply_off_never_dispatches_but_apply_now_still_does() {
+        let mut model = controllable_model(control::ControlMode::Preset(control::Preset::Balanced));
+        let _ = model.update(Message::AutoReapplyToggled(false));
+
+        for _ in 0..5 {
+            let _ = model.update(diverging_tick());
+        }
+        assert!(!model.apply_in_flight);
+        assert_eq!(model.divergent_samples, 0);
+
+        // The user asking is still unconditional.
+        let _ = model.update(Message::ApplyRequested);
+        assert!(model.apply_in_flight);
+    }
+
+    #[test]
+    fn matching_sample_never_dispatches_in_any_mode() {
+        let modes = [
+            control::ControlMode::Unmanaged,
+            control::ControlMode::Preset(control::Preset::Silent),
+            control::ControlMode::Preset(control::Preset::Balanced),
+            control::ControlMode::Preset(control::Preset::Performance),
+            control::ControlMode::Preset(control::Preset::Max),
+            control::ControlMode::Manual,
+        ];
+        for mode in modes {
+            let mut model = controllable_model(mode);
+            // Report back exactly what the mode asks for at 30 °C.
+            // The rounded expectation is a duty in [0, 100], so the cast is
+            // in range.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let duty = control::expected_fan_duty(&model.settings(), 30.0)
+                .map_or(50, |expected| expected.round() as u8);
+
+            let _ = model.update(status_tick(CONTROL_MATCH, Ok(control_status(30.0, duty))));
+
+            assert!(
+                !model.apply_in_flight,
+                "{mode:?} must not write on a matching sample",
+            );
+            assert_eq!(model.divergent_samples, 0, "{mode:?}");
+            assert_eq!(model.auto_applied_for, None, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn popup_closed_clears_pending_fan_duty() {
+        // Same staleness trap as the interval slider: a compositor-driven
+        // close skips the release, so the staged duty must not survive it.
+        let mut model = controllable_model(control::ControlMode::Manual);
+        let id = Id::unique();
+        model.popup = Some(id);
+        model.pending_fan_duty = Some(85.0);
+
+        let _ = model.update(Message::PopupClosed(id));
+
+        assert_eq!(model.pending_fan_duty, None);
+        assert_eq!(model.config.manual_fan_duty, 50);
     }
 }
