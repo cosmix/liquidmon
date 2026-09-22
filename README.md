@@ -281,6 +281,32 @@ Optional dependency-CVE scanning needs `cargo install cargo-audit --locked`
 once. Push-time bypasses if you really need them: `git push --no-verify`
 or `LIQUIDMON_SKIP_AUDIT=1 git push ...` (skips just the audit step).
 
+### Releasing
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which checks
+the tag against the `Cargo.toml` version, builds with `--locked`, and
+uploads the `.deb`, the tarball, and `SHA256SUMS` to GitHub Releases.
+
+1. Add a section for the new version to `CHANGELOG.md` listing the
+   user-facing changes since the last tag.
+2. Add a matching `<release version="X.Y.Z" date="YYYY-MM-DD">` entry to
+   `resources/app.metainfo.xml`. Commit both files.
+3. Run `just ci-local`.
+4. Run `just tag X.Y.Z`. It bumps `version` in `Cargo.toml`, regenerates
+   `Cargo.lock`, commits `release: X.Y.Z`, and creates the annotated tag
+   `vX.Y.Z`. It also runs `cargo clean`, so the next build is a full one.
+5. Push the commit, then the tag:
+
+   ```sh
+   git push && git push origin vX.Y.Z
+   ```
+
+6. Watch the Release workflow (`gh run watch`) and check the assets on
+   the release page.
+
+Don't bump the version in `Cargo.toml` by hand. `Cargo.lock` also records
+the package version, and if the two disagree the CI `--locked` build fails.
+
 ### Running as a standalone window
 
 When the binary is launched outside the COSMIC panel, libcosmic falls back
