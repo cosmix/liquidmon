@@ -12,7 +12,7 @@ use crate::liquidctl::DetectedDevice;
 /// parser schema; see PLAN-device-selector.md "Compatibility Constraints".
 const AIO_PATTERNS: &[&str] = &[
     "hydro",  // Corsair Hydro Pro / Pro XT / Platinum (hydro_platinum.py)
-    "icue h", // Corsair iCUE Elite Capellix / RGB     (hydro_platinum.py)
+    "icue h", // Corsair iCUE Elite RGB (hydro_platinum.py)
 ];
 
 /// Returns true when `description` contains any AIO_PATTERNS substring,
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn is_aio_matches_known_substrings() {
         assert!(is_aio("Corsair Hydro H150i Pro XT"));
-        assert!(is_aio("Corsair iCUE H100i Elite Capellix"));
+        assert!(is_aio("Corsair iCUE H100i Elite RGB"));
     }
 
     #[test]
@@ -69,7 +69,7 @@ mod tests {
         let list = vec![
             dev("Gigabyte RGB Fusion 2.0 8297 Controller"),
             dev("Corsair Hydro H150i Pro XT"),
-            dev("Corsair iCUE H100i Elite Capellix"),
+            dev("Corsair iCUE H100i Elite RGB"),
         ];
         let picked = auto_select(&list).expect("should pick first AIO");
         assert_eq!(picked.description, "Corsair Hydro H150i Pro XT");
@@ -90,11 +90,11 @@ mod tests {
             dev("Gigabyte RGB Fusion 2.0 8297 Controller"),
             dev("Corsair Hydro H150i Pro XT"),
             dev("Corsair RMi Series Power Supply"),
-            dev("Corsair iCUE H100i Elite Capellix"),
+            dev("Corsair iCUE H100i Elite RGB"),
         ];
         let aios = filter_aios(&list);
         assert_eq!(aios.len(), 2);
         assert_eq!(aios[0].description, "Corsair Hydro H150i Pro XT");
-        assert_eq!(aios[1].description, "Corsair iCUE H100i Elite Capellix");
+        assert_eq!(aios[1].description, "Corsair iCUE H100i Elite RGB");
     }
 }
