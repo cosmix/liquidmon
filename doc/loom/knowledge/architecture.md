@@ -25,26 +25,31 @@ src/
 ## Module Dependency Graph — UPDATED 2026-06-12
 
 ```text
-main.rs  (14 lines)
-  ├── mod config    (config.rs)
-  ├── mod devices   (devices.rs)
-  ├── mod equalizer (equalizer.rs)
-  ├── mod liquidctl (liquidctl.rs)
-  ├── mod sparkline (sparkline.rs)
-  ├── mod spinner   (spinner.rs)
-  ├── mod view      (view.rs)      ← NEW module added 2026-06-12
-  └── mod app       (app.rs)
+main.rs  (17 lines)
+  ├── mod config       (config.rs)
+  ├── mod control      (control.rs)       ← NEW 2026-09-22
+  ├── mod control_view (control_view.rs)  ← NEW 2026-09-22
+  ├── mod curve        (curve.rs)         ← NEW 2026-09-22
+  ├── mod devices      (devices.rs)
+  ├── mod equalizer    (equalizer.rs)
+  ├── mod liquidctl    (liquidctl.rs)
+  ├── mod sparkline    (sparkline.rs)
+  ├── mod spinner      (spinner.rs)
+  ├── mod view         (view.rs)
+  └── mod app          (app.rs)
         ├── uses crate::config::Config
-        ├── uses crate::liquidctl::{AioStatus, DetectedDevice, list_devices, fetch_status}
+        ├── uses crate::control                                 (settings model, argv builders, divergence)
+        ├── uses crate::control_view::control_section           (popup cooling section)
+        ├── uses crate::liquidctl::{AioStatus, DetectedDevice, list_devices, fetch_status, apply_control}
         ├── uses crate::devices::{filter_aios, auto_select}
         ├── uses crate::sparkline::{Sparkline, SparklineTint}   (panel button only)
         ├── uses crate::spinner::Kind                           (popup spinner glyphs via view)
         └── uses crate::view                                    (popup builders; pub(crate) surface)
 ```
 
-`main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the primary consumer of `config`, `liquidctl`, `devices`, and `view`. The `view` module owns the popup widget builders; `equalizer`, `spinner`, and `sparkline` are consumed by `view` (and directly by `app` for the panel button sparkline). The `devices` module depends only on `liquidctl::DetectedDevice`.
+`main.rs` owns binary entry and delegates entirely to `cosmic::applet::run::<app::AppModel>(())`. The `app` module is the primary consumer of `config`, `control`, `control_view`, `liquidctl`, `devices`, and `view`. The `view` module owns the read-only popup widget builders; `control_view` owns the cooling-control section and is a sibling of `view`, not part of it — it was split out deliberately so `view.rs` did not grow from 411 to ~590 lines. `equalizer`, `spinner`, and `sparkline` are consumed by `view` (and directly by `app` for the panel button sparkline); `curve` is consumed by `control_view`. The `devices` module depends only on `liquidctl::DetectedDevice`. `control` depends on `liquidctl::AioStatus` (for divergence detection) and on nothing else in the crate — deliberately, so all of it is unit-testable without a subprocess or a renderer.
 
-**8 source modules total:** `app`, `config`, `devices`, `equalizer`, `liquidctl`, `sparkline`, `spinner`, `view`.
+**11 source modules total:** `app`, `config`, `control`, `control_view`, `curve`, `devices`, `equalizer`, `liquidctl`, `sparkline`, `spinner`, `view`.
 
 ## COSMIC Applet Framework Integration
 
@@ -61,13 +66,13 @@ Panel button is rendered by `view()` (src/app.rs:120-165); popup overlay by `vie
 
 ## AppModel State Structure — UPDATED 2026-06-12
 
-`src/app.rs:92-132`
+`src/app.rs` — read-only monitoring state, then the cooling-control state added 2026-09-22.
 
 ```text
 AppModel {
     core:                  cosmic::Core           // COSMIC runtime handle
     popup:                 Option<Id>             // Some(id) when popup is open
-    config:                Config                 // Persisted config (cosmic_config) — v3
+    config:                Config                 // Persisted config (cosmic_config) — v4
     config_handle:         Option<cosmic_config::Config>  // kept alive for write_entry
     pending_interval_secs: Option<f32>            // slider drag value (None outside drag); cleared on popup close
     last_status:           Option<AioStatus>      // Most-recent successful liquidctl read
@@ -79,20 +84,27 @@ AppModel {
     device_scan_in_flight: bool                   // True while a list_devices Task is in flight
     anim_t:                f32                    // Popup animation clock (seconds); advances only while popup is open
     enumeration_retried:   bool                   // Guards one-shot re-enumeration retry after initial failure
+
+    // Cooling control
+    pending_fan_duty:      Option<f32>            // manual slider mid-drag; commits on release
+    apply_in_flight:       bool                   // an apply subprocess sequence is running
+    apply_queued:          bool                   // ONE coalesced follow-up, not a queue
+    applying_settings:     Option<Settings>       // what the in-flight apply actually dispatched
+    auto_applied_for:      Option<String>         // device whose one automatic write this run is spent
+    marker_checked_for:    Option<String>         // device whose per-boot marker was already read
+    divergent_samples:     u8                     // consecutive contradicting samples; 2 triggers a write
+    last_apply:            ApplyStatus            // Never / Ok{at,writes} / Failed{stderr,writes}
+    pump_model:            segmented_button::SingleSelectModel
 }
 ```
 
-The popup renders three 64 px VU-meter equalizer canvases (coolant temperature, pump duty, fan-average duty). Pump speed and per-fan speed are surfaced as numeric labels in metric-block headers rather than as separate canvases.
+Three of these are not in the original plan and exist for specific failure modes:
 
-Constants at `src/app.rs:25-33`:
+- `applying_settings` — the per-boot marker must be stamped from what was *dispatched*, not from `self.config` when the result lands. A gesture or `UpdateConfig` arriving mid-write would otherwise record settings the device never received, suppressing a needed re-apply for the rest of the boot.
+- `marker_checked_for` — the marker is file IO and the poll runs every 1.5 s; without this the non-matching case re-reads it on every tick.
+- `apply_in_flight` / `apply_queued` / `applying_settings` are all cleared by `reset_device_state`. A stale-match `ControlApplied` is dropped, so a device change mid-apply would otherwise leave `apply_in_flight` stuck true forever — the popup would show "Applying…" permanently and every later gesture would only set `apply_queued`.
 
-```text
-PANEL_SPARK_SAMPLES = 60             — trailing-N window fed to the panel button sparkline
-HISTORY_CAP         = 900            — maximum samples in every per-metric VecDeque (~15 min at 1 s)
-MIN_INTERVAL_MS     = 1000           — lower bound for the user-configurable sample interval
-MAX_INTERVAL_MS     = 10000          — upper bound for the user-configurable sample interval
-ANIM_INTERVAL       = Duration(33ms) — drives both the iced `every(...)` subscription and the per-tick anim_t advance
-```
+`pump_model` is stateful and cannot be rebuilt per render like the device dropdown's label vector. It is built in `init` with three entities carrying `PumpMode` data, and `activate(..)` must be called on **every** path that changes the pump mode — `init`, `ManualPumpSelected`, and `UpdateConfig`. Forgetting the activate call is the obvious bug here: the segments render, but the selection never moves.
 
 On a poll error, `last_status` is intentionally NOT cleared, so the UI can show stale readings alongside the error badge.
 
@@ -186,9 +198,9 @@ DeviceSelected(Option<String>)     [src/app.rs:425]
   └─ persist via config.write_entry(handle)
 ```
 
-`devices::is_aio` consults a substring catalog `AIO_PATTERNS` (`src/devices.rs`) of lowercase patterns covering `hydro_platinum.py`-compatible families (Corsair Hydro Pro/Pro XT/Platinum and iCUE Elite Capellix/RGB in v1). `filter_aios` and `auto_select` are pure functions returning borrowed slices/refs.
+`devices::is_aio` consults a substring catalog `AIO_PATTERNS` (`src/devices.rs`) of lowercase patterns covering `hydro_platinum.py`-compatible families: Corsair Hydro Pro/Pro XT/Platinum and iCUE **Elite RGB**. Corrected 2026-09-22 — earlier revisions of this file, the README, `Cargo.toml` and a `devices.rs` comment all claimed "iCUE Elite Capellix". liquidctl 1.15.0 contains no device named `Capellix`: those coolers use a Commander Core pump head (USB `1b1c:0c1c`), enumerated by `commander_core.py` as `Corsair Commander Core (broken)`, which the `"icue h"` pattern does not match and whose status schema was never tested against `parse_status_response`. `filter_aios` and `auto_select` are pure functions returning borrowed slices/refs.
 
-All `liquidctl` subprocess calls (`fetch_status`, `list_devices`) acquire a module-private `LIQUIDCTL_LOCK: LazyLock<tokio::sync::Mutex<()>>` (`src/liquidctl.rs:15`) so concurrent invocations cannot race on the exclusive HID claim. Lock is held only for the subprocess duration (≤3 s for status, ≤1 s for list).
+All `liquidctl` subprocess calls (`fetch_status`, `list_devices`, `apply_control`) acquire a module-private `LIQUIDCTL_LOCK: LazyLock<tokio::sync::Mutex<()>>` (`src/liquidctl.rs:15`) so concurrent invocations cannot race on the exclusive HID claim. Lock is held only for the subprocess duration (≤3 s for status, ≤1 s for list, ≤5 s per control step and across the whole control sequence).
 
 ## Liquidctl JSON Parsing (src/liquidctl.rs)
 
@@ -217,19 +229,27 @@ Error hierarchy (`src/liquidctl.rs:52-60`) — UPDATED 2026-06-12:
 
 ## Configuration System
 
-`src/config.rs:5-17` — `Config` derives `CosmicConfigEntry` with `#[version = 2]`. It carries one field:
+`src/config.rs` — `Config` derives `CosmicConfigEntry` with `#[version = 4]` (was 2 when this section was first written, 3 before 2026-09-22). It carries seven fields:
 
 ```rust
 pub struct Config {
     pub sample_interval_ms: u64,
+    pub device_match: Option<String>,
+    pub control_mode: control::ControlMode,
+    pub control_preset: control::Preset,
+    pub manual_fan_duty: u8,
+    pub manual_pump_mode: control::PumpMode,
+    pub auto_reapply: bool,
 }
 ```
 
-`Default` is hand-implemented (not derived) returning `sample_interval_ms: 1500`. The explicit `Default` is required because `#[derive(Default)]` was dropped when the non-default field was added; it also ensures that `CosmicConfigEntry::get_entry`'s field-by-field fallback picks up 1500 ms automatically when upgrading from a v1 config file that has no `sample_interval_ms` key.
+`Default` is hand-implemented (not derived): 1500 ms, `None`, `Unmanaged`, `Balanced`, 50, `Balanced`, `true`. `ControlMode::Unmanaged` as the default is load-bearing for safety — an upgrade must never start writing to cooler hardware on its own.
 
-Config is loaded in `AppModel::init` (`src/app.rs:161-168`) by constructing a single `cosmic_config::Config` handle, reading the entry from it, and storing both the parsed `Config` and the raw handle in `AppModel` (`config_handle`). Keeping the handle alive is required for `config.write_entry(&handle)` later. Hot-reload via `core().watch_config::<Config>(APP_ID)` subscription remains unchanged (`src/app.rs:293-296`). On load error the framework-provided partial config is used rather than panicking.
+**Version bumps here carry no migration code, deliberately.** `CosmicConfigEntry::get_entry` reads each field independently and falls back to that field's `Default` when its file is absent, so an older on-disk config opens with the user's saved values plus defaults for everything new. `config_default_uses_migration_fallback_values` (`src/app.rs`) pins this; extend that test when adding a field rather than writing migration code or a second test.
 
-APP_ID: `"com.github.cosmix.LiquidMon"` (`src/app.rs:81`)
+Config is loaded in `AppModel::init` by constructing a single `cosmic_config::Config` handle, reading the entry from it, and storing both the parsed `Config` and the raw handle in `AppModel` (`config_handle`). Keeping the handle alive is required for `config.write_entry(&handle)` later; `AppModel::persist_config()` wraps that best-effort write, which several `update` arms share. Hot-reload via `core().watch_config::<Config>(APP_ID)` remains unchanged. On load error the framework-provided partial config is used rather than panicking.
+
+APP_ID: `"com.github.cosmix.LiquidMon"`
 
 ## View Rendering Logic — UPDATED 2026-06-12
 
@@ -396,7 +416,7 @@ Targets and notable changes:
 
 ## doc/plans Directory
 
-`doc/plans/` exists but is currently empty — no active plans.
+`doc/plans/` holds design plans as `PLAN-<description>.md`, the only valid location for them. `PLAN-cooling-controls.md` (2026-09-22) is the design record for the cooling-control write path.
 
 ## .cargo Directory
 
@@ -464,3 +484,29 @@ The popup metric history is rendered as an 80s graphic-equalizer / VU-meter inst
 ## Popup Layout (redesigned — src/app.rs::popup_metrics_view)
 
 The popup is a `scrollable` `Column` (spacing 14, padding 16) of: device title (`heading` size 16) → divider → three `metric_block`s → per-fan breakdown (`fan_rows`, indented 8px) → divider → `interval_control` → `device_dropdown_section` → optional error caption. A `metric_block(glyph, label, value, history)` is a header `row![glyph, caption(LABEL), Space::new().width(Fill), mono value]` over the `Equalizer` canvas (`eq_canvas`, 64px tall). Labels are small-caps captions ("COOLANT"/"PUMP"/"FANS"/"SAMPLE INTERVAL"/"DEVICE"); numeric readouts are right-aligned mono via `metric_value(text, size)` (coolant 20px, pump/fan 15px). The coolant header carries a static 18px snowflake glyph; pump/fan headers carry animated `Spinner` glyphs. `Space::new().width(...)` is this iced fork's filler idiom — `Space::new()` takes no args and is configured via builder methods (`Space::with_width` does NOT exist here).
+
+## Cooling Control Write Path — ADDED 2026-09-22
+
+LiquidMon reads status and, since 0.4.0, writes fan curves and pump modes back through `liquidctl`. The write path is deliberately split so that everything decidable is pure and unit-tested, and only the subprocess call is not:
+
+```text
+Config (cosmic-config)                     persisted desired state
+  └─ AppModel::settings()      [src/app.rs]  → control::Settings
+       └─ control::apply_steps(match, settings, capability)   [src/control.rs]
+            → Option<Vec<Vec<String>>>   ordered argv, fan step then pump step
+                 └─ liquidctl::apply_control(steps)           [src/liquidctl.rs]
+                      └─ one LIQUIDCTL_LOCK guard across ALL steps
+                           └─ liquidctl --match M set fan speed <t d ...>
+                           └─ liquidctl --match M initialize --pump-mode <mode>
+       └─ Message::ControlApplied { match_str, result }
+            └─ on Ok: write per-boot marker, zero divergent_samples, bump write count
+```
+
+`control::capability(description)` classifies a device by ordered case-insensitive substring rules (`"platinum"`, `"pro xt"`, `"elite rgb"`) and gates the whole path: only `hydro_platinum` devices return `FanDutyAndPumpMode`. Everything else renders read-only. The lookup is a pure function precisely so `asetek_pro` and `commander_core` can be added later without touching the UI.
+
+Two driver constraints, both verified in liquidctl 1.15.0 sources, dictate the shape and must not be "simplified" away:
+
+- **`hydro_platinum` does no partial writes.** Every `set_fixed_speed`/`set_speed_profile` rebuilds the entire cooling payload from liquidctl's runtime key-value store in `$XDG_RUNTIME_DIR/liquidctl`, which is wiped on reboot. A fan channel with no stored mode falls back to 100% duty and `pump_mode` falls back to `balanced`. Consequences: always write the whole `fan` channel (never `fanN` — a per-fan write on a cold store slams the untouched fans to 100%), and always order the fan step before `initialize --pump-mode`, since `initialize` re-sends the same full payload. Fan-first costs at most one poll interval of `balanced` pump; pump-first would cost a burst of 100% fans.
+- **Pump mode is not readable on this family.** Status reports pump duty and rpm, never the mode, and the duty a mode produces varies by model. So pump mode is only ever written as the second step of a write the fan check already justified, or on a direct user gesture. An externally changed pump mode is undetectable; "Apply now" is the remedy.
+
+Curves are `(liquid °C, duty %)` pairs against the cooler's own sensor. liquidctl's `normalize_profile` appends a `(60, 100)` failsafe and `_prepare_profile` pads to exactly 7 points, raising `ValueError` past that — hence preset curves are capped at 6 points, pinned by a unit test. `control::curve_points` returns what is *sent*; `control::effective_curve` returns what the *device runs* (points + failsafe) and is what both the divergence prediction and the UI preview consume, so the two cannot drift.

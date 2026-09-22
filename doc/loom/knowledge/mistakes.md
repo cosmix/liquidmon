@@ -55,3 +55,23 @@
 - Stage `Cargo.lock` in the same commit as the `Cargo.toml` version change; never let a version bump and its lock update land in separate commits.
 
 **Fix:** Committed the regenerated `Cargo.lock` to sync `0.3.1`, then cut `0.3.2` with `Cargo.toml` + `Cargo.lock` + metainfo in one `release:` commit, verified by `cargo check --locked`, and deleted the stale never-pushed `v0.3.1` tag.
+
+## Hand-written `Default` on a unit enum fails the clippy gate (2026-09-22)
+
+**What happened:** A subagent brief instructed hand-written `impl Default for ControlMode/Preset/PumpMode`, mirroring `config.rs`'s explicit-default convention. `clippy::derivable_impls` rejected all three.
+
+**Why:** `derivable_impls` is in clippy's default `style` group, not `pedantic`, and CI runs `cargo clippy --all-targets --all-features -- -D warnings` — so it is a hard build failure, not an advisory nit. `config.rs`'s own hand-written `Default` is not flagged because its body sets several distinct literal field values, a shape `#[derive(Default)]` cannot express. That is why the convention exists there, and why it does not transfer to a plain unit enum whose `Default` is just "return this one variant".
+
+**Prevention:** For a unit enum whose default is a single variant, use `#[derive(Default)]` with `#[default]` on the variant. Reserve hand-written `Default` impls for types where the body is not what the derive macro would produce. More generally: a house convention stated for one type shape does not automatically apply to another — check which lints the gate actually enforces before mandating a style in a brief.
+
+**Fix:** `src/control.rs` derives `Default` with `#[default]` on `ControlMode::Unmanaged`, `Preset::Balanced`, `PumpMode::Balanced`, and `ApplyStatus::Never`.
+
+## Tests that write the real per-boot marker file (2026-09-22)
+
+**What happened:** `src/app.rs` tests that deliver `ControlApplied(Ok)` after a real dispatch caused the success path to write `$XDG_RUNTIME_DIR/liquidmon/applied` for real, during `cargo test`.
+
+**Why:** The marker write is the genuine production path; nothing in the test harness redirects `XDG_RUNTIME_DIR`, and `std::env::set_var` is `unsafe` in edition 2024 so per-test redirection was deliberately avoided. A test run therefore clobbers the running applet's marker, and can make a later run skip its own divergence check.
+
+**Prevention:** Assert the failure path (`Err`) wherever success is not the point of the test, and use a device description no real cooler reports — the suite uses `Corsair Hydro H999i Pro XT`. Pure marker round-trip tests take the directory as an argument and point it at a unique subdirectory of `std::env::temp_dir()` they create and remove; `control::marker_matches`/`write_marker` are shaped that way for exactly this reason.
+
+**Fix:** Both measures are in place in `src/app.rs` and `src/control.rs` tests. Any new test touching the apply success path must follow the same two rules.

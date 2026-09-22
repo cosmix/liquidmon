@@ -514,3 +514,53 @@ fn reset_device_state(&mut self) {
 ```
 
 Both `DevicesEnumerated` (auto-pick changed) and `DeviceSelected` (explicit pick changed) invoke this. New per-device state added in the future (e.g. another sparkline history) is reset by editing one place. The helper is `&mut self`-only and does not return a `Task`, so it composes cleanly inside an `update` arm that may also need to return a Task downstream.
+
+## Non-Reentrant Lock Split for Multi-Step Subprocess Sequences (src/liquidctl.rs) — ADDED 2026-09-22
+
+`LIQUIDCTL_LOCK` is a `tokio::sync::Mutex` and is **not reentrant**. When `apply_control` needed to hold it across a two-step sequence (fan write, then pump write) so a status poll could not interleave, the obvious shape — a shared `run_liquidctl` that each step calls — self-deadlocks on the second step.
+
+The pattern, which generalises to any "hold one lock across several guarded operations":
+
+```rust
+/// Caller MUST hold LIQUIDCTL_LOCK.
+async fn run_liquidctl_locked(args: &[&str], timeout: Duration) -> Result<String, Error>;
+
+/// Acquires the lock, then delegates.
+async fn run_liquidctl(args: &[&str], timeout: Duration) -> Result<String, Error>;
+
+pub async fn apply_control(steps: Vec<Vec<String>>) -> Result<(), Error> {
+    let _guard = LIQUIDCTL_LOCK.lock().await;   // once, for the whole sequence
+    for step in steps { run_liquidctl_locked(...).await?; }  // never run_liquidctl
+    Ok(())
+}
+```
+
+The lock-free inner function carries the precondition in its doc comment; single-call entry points (`fetch_status`, `list_devices`) use the wrapper. Per-call timeouts stay on the inner function (3 s status, 1 s list, 5 s per control step) and clock only after the lock is acquired, so the bound is per-subprocess, not end-to-end.
+
+## Bounded Automatic Side Effects (src/app.rs) — ADDED 2026-09-22
+
+The cooling feature writes to hardware, so "reconcile until it matches" — the obvious control-loop shape — is the wrong one: it would hold the subprocess lock repeatedly, stomp settings the user made elsewhere, and spin forever against a device that rejects every write. The rule the code implements instead, worth copying for any future side effect against the device:
+
+> Write on a user gesture, or **at most once per applet run** when there is positive evidence the device is not running the desired setting. Never on a timer, never at start unconditionally, never when the observed state already matches.
+
+Four mechanisms enforce it, all in `AppModel::update`/`evaluate_divergence`:
+
+1. **Confirmation count.** `divergent_samples` must reach 2 consecutive contradicting samples before an automatic write. Any matching sample resets it to 0, so a sample taken mid-ramp or right after a resume cannot trigger one.
+2. **Per-run budget.** `auto_applied_for` is set when an automatic apply is *dispatched*, not when it succeeds — so a device that rejects every write is asked exactly once. Cleared only when the effective device changes.
+3. **Per-boot fast path.** A marker at `$XDG_RUNTIME_DIR/liquidmon/applied` holding `<description>\n<settings fingerprint>` short-circuits the check entirely for the rest of the boot. It lives in the same tmpfs liquidctl uses for its own runtime store, so it dies exactly when that store does. `marker_dir()` returns `None` when `XDG_RUNTIME_DIR` is unset rather than falling back to a persistent path — a persistent marker would suppress a needed write after a power cut. The marker is an optimisation, never the authority.
+4. **Coalescing, not queueing.** `apply_queued` is a `bool`. A gesture arriving mid-write sets it; the `ControlApplied` arm clears it and dispatches exactly one more apply with the settings as they stand then. A burst of gestures collapses into one follow-up write.
+
+Only user gestures bypass all four. The whole policy is pinned by tests in `src/app.rs` that assert on model state (`apply_in_flight`, `auto_applied_for`, `divergent_samples`) rather than on the returned `Task`, which is opaque.
+
+## Pinned libcosmic Widget API Gotchas (rev 564ef83) — ADDED 2026-09-22
+
+`libcosmic` is pinned to a bare git SHA, not a release, so upstream docs and iced-0.12 examples do not apply. Verified against `~/.cargo/git/checkouts/libcosmic-41009aea1d72760b/564ef83/`:
+
+- `checkbox` is `checkbox(is_checked).label(..).on_toggle(..)` — NOT the 3-arg `checkbox(label, checked, msg)` form.
+- Text colour needs `.class(cosmic::theme::Text::Custom(|theme| iced text::Style { .. }))`. `.color()` / `.style()` do not compile on `cosmic::Theme`, whose text `Class` is a `Copy` fn-pointer enum rather than a boxed `StyleFn`.
+- `widget::dropdown` renders flat labels only (`selections: impl Into<Cow<'a, [S]>> where S: AsRef<str>`); multi-line menu entries are not buildable with it. Put the explanation in a caption under the dropdown.
+- `segmented_button::SingleSelectModel` is stateful — it lives in the model, not in the view builder, and needs `activate(..)` on every path that changes the selection.
+- `canvas::{LineCap, LineDash, LineJoin}` are re-exported directly off `canvas::`. `Stroke` has no `with_line_dash` builder; set `line_dash` via struct-update syntax.
+- `Space::new()` takes no args and is configured via builder methods; `Space::with_width` does not exist here.
+
+When a widget's API is not what a plan or an example assumes, read the pinned checkout rather than guessing.

@@ -141,3 +141,21 @@ The ENFORCED quality gate is `cargo clippy --all-targets --all-features -- -D wa
 `just check` runs `-W clippy::pedantic` WITHOUT `--all-targets` — advisory, non-blocking. Under the full `cargo clippy --all-targets --all-features -- -W clippy::pedantic` command there are ~14 pre-existing pedantic warnings (e.g. `doc_markdown` on type names like `AioStatus`/`AIO_PATTERNS` in doc comments; `too_many_lines` on `update`; `cast_*` on the bounded cast helpers which use justifying in-code comments rather than `#[allow]`s; elidable lifetimes). These are intentionally unfixed; the project is NOT pedantic-clean.
 
 **Rule for future reviewers:** never claim "zero pedantic warnings" without running the exact command `cargo clippy --all-targets --all-features -- -W clippy::pedantic` and reading all output. The `just check` output omits `--all-targets` and therefore misses warnings emitted only in test targets.
+
+## Cooling control is unverified on real hardware (2026-09-22)
+
+`just ci-local` is green (fmt, `clippy -D warnings`, 177 tests, release build) and the write path is covered by unit tests, but **none of the 10-step manual hardware matrix in `doc/plans/PLAN-cooling-controls.md` §Verification has been run**. Nothing in CI exercises an actual `liquidctl set`/`initialize`, by design — subprocess-touching code stays untested there, as `fetch_status`/`list_devices` already are.
+
+The unrun checks that matter most: no write at all in `Unmanaged` on a fresh install; no fan spike to 100% after `rm -rf $XDG_RUNTIME_DIR/liquidctl` (the cold-store clobber case); exactly one `set fan` + `initialize` pair after two diverging samples and nothing further; zero writes on an applet restart when the cooler still holds the setting. The plan documents a `PATH` shim that logs every argv, which is the cheapest way to run the matrix.
+
+## app.rs and control.rs are well past the 400-line ceiling (2026-09-22)
+
+`src/app.rs` is 1985 lines (was 1225), `src/control.rs` 843, `src/liquidctl.rs` ~790 — tests included in all three. The cooling change kept every piece that could live in a new file out of the existing ones (`control.rs`, `control_view.rs`, `curve.rs` are new; `control_view` exists specifically so `view.rs` did not grow to ~590 lines), but `app.rs` still took ~140 lines of state, message arms and dispatch plus 20 tests.
+
+Splitting `app.rs` is its own change and was deliberately not folded into the feature diff. The natural seam is the Elm `update` arms: the control-related arms and their helpers (`dispatch_apply`, `evaluate_divergence`, `record_apply_result`, `commit_pending_fan_duty`) are already a coherent group with no read-path dependencies.
+
+## Knowledge tier-1 files are past the split threshold (2026-09-22)
+
+`loom knowledge check` reports `architecture.md` at 512 lines and `patterns.md` at 566, with individual sections over the ~40-line guidance (`AppModel State Structure` 43, `Error Handling Patterns` 63, `Naming Conventions` 45). The tree is still flat — there is no `INDEX.md` and no per-category tier-2 directories — so everything lands inline by necessity.
+
+Deferred knowingly. Converting to the hierarchical layout is a restructure of the whole tree, not something to fold into a feature change, and the flat files are still readable. The trigger to do it: the next time a single topic would add more than ~40 lines to a tier-1 file, scaffold `<category>/<slug>` instead and let `INDEX.md` generate. The check's `hydro_platinum.py` / `commander_core.py` "source reference does not exist" lines are false positives — those are liquidctl's own sources, not files in this repo.
