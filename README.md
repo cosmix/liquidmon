@@ -7,7 +7,9 @@ average fan duty %, and pump duty %. Clicking it opens a popup with the
 device description, three VU-meter equalizer charts (coolant temperature,
 pump duty, fan-average duty) spanning up to 900 samples (~22.5 min at the
 1.5 s default interval, ~15 min at the 1 s minimum), and a slider that sets
-the sample interval (1.0 s – 10.0 s, persisted via cosmic-config).
+the sample interval (1.0 s – 10.0 s, persisted via cosmic-config). On
+supported Corsair coolers the popup also sets fan and pump behaviour, from
+four presets or manually (see [Cooling Control](#cooling-control)).
 
 The applet polls `liquidctl --json status` at the configured interval (default
 1.5 s) with a 3-second per-call timeout. If a poll fails, the last successful
@@ -65,6 +67,10 @@ with a pump mode:
   at 45°C. Pump: Extreme.
 - **Max** — fans fixed at 100%, no curve. Pump: Extreme.
 
+For a preset with a curve, the popup draws the curve the cooler is running
+(20–60°C), with a marker at the current coolant temperature. Max has no
+curve, so it shows a caption in its place.
+
 ### Manual mode
 
 Manual mode has one duty slider that drives every fan together (20–100%, in
@@ -99,6 +105,11 @@ all — including on upgrade from an older version, which stays Unmanaged until
 you pick a mode yourself. A "Re-apply if the cooler loses it" switch turns the
 automatic write off entirely; with it off, the saved setting is still shown
 and an "Apply now" button sends it on demand.
+
+Once the applet has written to the cooler, a status line shows when the last
+write happened and how many writes it has made this session, for example
+`Written 4 min ago · 3 writes this session`. If a write fails, the line shows
+liquidctl's error.
 
 ### Requirements
 
