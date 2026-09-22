@@ -24,7 +24,7 @@ App ID: `com.github.cosmix.LiquidMon`
 LiquidMon ships v1 with verified support for two AIO families:
 
 - **Corsair Hydro Pro / Pro XT / Platinum** (e.g. H100i, H115i, H150i Pro XT, H170i)
-- **Corsair iCUE Elite Capellix / RGB** (e.g. H100i Elite Capellix, H150i Elite RGB)
+- **Corsair iCUE Elite RGB** (e.g. H100i Elite RGB, H150i Elite RGB)
 
 Connected liquidctl devices are enumerated on launch and when the popup is
 opened. The first compatible AIO is auto-selected; a dropdown in the popup
@@ -42,6 +42,93 @@ those families ship under a separate parser change.
   truly-identical devices.
 - **Hot-plug detected on popup open.** Plugging in a new cooler does not
   auto-update the panel; open the popup once to trigger re-enumeration.
+
+## Cooling Control
+
+Devices in the `hydro_platinum` family — Corsair Hydro H60i/H100i/H115i/H150i
+**Pro XT**, Hydro H100i/H115i **Platinum** (and **Platinum SE**), and iCUE
+H100i/H115i/H150i **Elite RGB** — can be driven from the popup: four presets,
+or a manual duty and pump mode. Every other connected device, including the
+plain (non-XT) Hydro Pro family, stays read-only; the popup shows a caption
+saying so instead of the controls.
+
+### Presets
+
+Each preset writes a fan curve `(liquid °C, duty %)` into the cooler along
+with a pump mode:
+
+- **Silent** — 20% at 25°C, 25% at 30°C, 35% at 35°C, 50% at 40°C, 75% at
+  45°C. Pump: Quiet.
+- **Balanced** — 25% at 25°C, 35% at 30°C, 50% at 35°C, 70% at 40°C, 90% at
+  45°C. Pump: Balanced.
+- **Performance** — 40% at 25°C, 55% at 30°C, 70% at 35°C, 85% at 40°C, 100%
+  at 45°C. Pump: Extreme.
+- **Max** — fans fixed at 100%, no curve. Pump: Extreme.
+
+### Manual mode
+
+Manual mode has one duty slider that drives every fan together (20–100%, in
+steps of 5%) and a three-way pump mode: Quiet, Balanced, or Extreme.
+
+The slider's floor is 20%, not 0%. The driver accepts lower values, but most
+120/140 mm fans stall out below roughly 20% duty, and a stalled fan looks the
+same as a failed one in the popup.
+
+Pump control on this cooler family is three modes, not a percentage — the
+driver has no pump-duty write, only the mode.
+
+### Where the setting lives
+
+Presets and manual settings are written into the cooler itself. Once applied,
+the cooler keeps running that curve or duty and pump mode after LiquidMon
+closes, across a logout, and across a reboot on any system whose PSU keeps
++5 V standby power alive. The setting is lost only on a full power cut (PSU
+switch, unplugging, or a battery pull) — after that, LiquidMon writes it back
+the same way it always does: once it notices divergence, not instantly.
+
+### Write policy
+
+LiquidMon never writes to the cooler on a timer, and never writes
+unconditionally at startup. At most one automatic write happens per applet
+run, and only after two consecutive status samples show the cooler running
+something other than the saved setting. LiquidMon never passes
+`--non-volatile` to liquidctl, on any device.
+
+The default control mode is **Unmanaged**, in which LiquidMon never writes at
+all — including on upgrade from an older version, which stays Unmanaged until
+you pick a mode yourself. A "Re-apply if the cooler loses it" switch turns the
+automatic write off entirely; with it off, the saved setting is still shown
+and an "Apply now" button sends it on demand.
+
+### Requirements
+
+Cooling control needs the same udev / `uaccess` setup as monitoring — no root
+and no privilege escalation. `/etc/udev/rules.d/71-liquidctl.rules` tags the
+AIO's HID nodes `uaccess`, the same rule that already lets the applet read
+status without elevated permissions. See [udev rules](#udev-rules) if the
+controls render read-only on a supported model.
+
+### Limitations
+
+- Pump control is three modes (Quiet / Balanced / Extreme), not a duty
+  percentage — the driver exposes no pump-duty write on this family.
+- Applying a setting holds the liquidctl subprocess lock for roughly a
+  second, so one status sample may arrive late right after a change.
+- A setting written into the cooler survives a LiquidMon restart, a logout,
+  and (on systems whose PSU keeps standby power alive) a reboot. It is lost
+  on a full power cut, after which LiquidMon re-applies it once — two poll
+  intervals after it notices, not instantly.
+- If something else changes the fan duty (a manual `liquidctl` call, iCUE
+  running in a VM), LiquidMon treats that as divergence and reclaims the
+  setting once per run — not repeatedly, and never if the re-apply switch is
+  off.
+- If something else changes only the pump mode, LiquidMon can't see it:
+  status reporting on this family includes pump duty and RPM but never the
+  mode. Use "Apply now" to force it back.
+- The tolerance used to detect a preset curve as still applied is fairly
+  wide (6 percentage points). A cooler running a similar curve set by other
+  software may read as already matching and be left alone — a missed
+  divergence costs nothing, a false one costs an unwanted write.
 
 ## Install
 
