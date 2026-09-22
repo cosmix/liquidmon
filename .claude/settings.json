@@ -1,12 +1,21 @@
 {
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
   "permissions": {
     "allow": [
       "Read(.work/**)",
-      "Write(.work/**)",
       "Read(.claude/CLAUDE.md)",
       "Read(~/.claude/CLAUDE.md)",
       "Read(~/.claude/hooks/loom/**)",
-      "Bash(loom *)"
+      "Bash(loom *)",
+      "Read(.loom/work/**)",
+      "Read(~/.claude/loom-skill-catalog/**)",
+      "Read(~/.claude/skills/**)",
+      "Bash(~/.claude/hooks/loom/codex-forward.sh:*)",
+      "Bash(/home/dkaponis/.claude/hooks/loom/codex-forward.sh:*)"
     ]
   }
 }
